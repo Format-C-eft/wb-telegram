@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+
+export PATH := /usr/lib/go-1.26/bin:$(PATH)
+
+%:
+	dh $@
+
+# Тесты запускаются локально и в CI (make test), не при кросс-сборке пакета.
+override_dh_auto_test:
+
+# Init-скрипта нет, только systemd-юнит.
+override_dh_installinit:
+	dh_installinit --noscripts
+
+# dh_fixperms сбрасывает права каталогов в 0755; каталог токена должен быть 0700.
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0700 debian/wb-telegram/etc/wb-telegram
+
+# gzip — чтобы пакет ставился и старым dpkg (bullseye).
+override_dh_builddeb:
+	dh_builddeb -- -Zgzip

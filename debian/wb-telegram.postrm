@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -e
+
+# При полном удалении пакета убираем сохранённый токен бота.
+if [ "$1" = "purge" ]; then
+    rm -f /etc/wb-telegram/token
+    rmdir /etc/wb-telegram 2>/dev/null || true
+fi
+
+#DEBHELPER#

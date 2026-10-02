@@ -1,0 +1,65 @@
+version: "2"
+
+run:
+  tests: true
+  concurrency: 4
+
+formatters:
+  enable:
+    - goimports
+
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/Format-C-eft/wb-telegram
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - revive
+    - errcheck
+    - ineffassign
+    - unused
+    - unconvert
+    - gocyclo
+    - gocritic
+    - dupl
+    - gosec
+    - misspell
+    - nolintlint
+    - nlreturn
+    - paralleltest
+    - wsl_v5
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+    govet:
+      enable:
+        - shadow
+    dupl:
+      threshold: 100
+    gocyclo:
+      min-complexity: 15
+    misspell:
+      locale: US
+      ignore-rules:
+        - mosquitto
+
+  exclusions:
+    generated: lax
+    paths:
+      - ".*_mock\\.go$"
+      - "internal/bot/mock"
+    rules:
+      - path: _test\.go$
+        linters:
+          - errcheck
+          - dupl
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

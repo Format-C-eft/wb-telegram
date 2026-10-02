@@ -1,0 +1,6 @@
+wb-telegram (0.1.0) stable; urgency=medium
+
+  * Первая версия: команды Telegram в MQTT, сообщения правил через send,
+    настройки в веб-интерфейсе через wb-mqtt-confed.
+
+ -- Format_C_eft <87527599+Format-C-eft@users.noreply.github.com>  Fri, 02 Oct 2026 12:35:21 +0500
