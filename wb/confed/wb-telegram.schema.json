@@ -1,0 +1,235 @@
+{
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "type": "object",
+    "title": "Telegram Bot",
+    "description": "wb-telegram_description",
+
+    "configFile": {
+        "path": "/etc/wb-telegram.conf",
+        "service": "wb-telegram",
+        "toJSON": ["/usr/bin/wb-telegram", "-to-json"],
+        "fromJSON": ["/usr/bin/wb-telegram", "-from-json"]
+    },
+
+    "options": {
+        "disable_edit_json": true,
+        "disable_properties": true,
+        "disable_collapse": true
+    },
+
+    "required": ["enabled", "reply_timeout_s", "users", "commands"],
+
+    "properties": {
+        "enabled": {
+            "type": "boolean",
+            "title": "Enable Bot",
+            "_format": "checkbox",
+            "default": false,
+            "propertyOrder": 1
+        },
+
+        "token": {
+            "type": "string",
+            "title": "Bot Token",
+            "description": "token_description",
+            "_format": "password",
+            "default": "",
+            "pattern": "^$|^[0-9]+:[A-Za-z0-9_-]+$",
+            "options": {
+                "patternmessage": "Invalid token format"
+            },
+            "propertyOrder": 2
+        },
+
+        "token_status": {
+            "type": "string",
+            "title": "Token Status",
+            "enum": ["set", "unset"],
+            "options": {
+                "enum_titles": ["Set", "Not Set"]
+            },
+            "readonly": true,
+            "propertyOrder": 3
+        },
+
+        "delete_token": {
+            "type": "boolean",
+            "title": "Delete Token",
+            "description": "delete_token_description",
+            "_format": "checkbox",
+            "default": false,
+            "propertyOrder": 4
+        },
+
+        "reply_timeout_s": {
+            "type": "integer",
+            "title": "Rule Reply Timeout (s)",
+            "description": "reply_timeout_description",
+            "minimum": 1,
+            "maximum": 300,
+            "default": 10,
+            "propertyOrder": 5
+        },
+
+        "debug": {
+            "type": "boolean",
+            "title": "Debug Logging",
+            "_format": "checkbox",
+            "default": false,
+            "propertyOrder": 6
+        },
+
+        "users": {
+            "type": "array",
+            "title": "Users",
+            "description": "users_description",
+            "_format": "table",
+            "propertyOrder": 7,
+            "options": {
+                "disable_array_reorder": true,
+                "disable_array_delete_last_row": true
+            },
+            "items": {
+                "type": "object",
+                "title": "User",
+                "required": ["name", "chat_id"],
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "title": "Name",
+                        "minLength": 1,
+                        "propertyOrder": 1
+                    },
+                    "chat_id": {
+                        "type": "integer",
+                        "title": "Chat ID",
+                        "propertyOrder": 2
+                    },
+                    "notifications": {
+                        "type": "boolean",
+                        "title": "System Notifications",
+                        "_format": "checkbox",
+                        "default": false,
+                        "propertyOrder": 3
+                    }
+                }
+            }
+        },
+
+        "commands": {
+            "type": "array",
+            "title": "Commands",
+            "description": "commands_description",
+            "_format": "tabs",
+            "maxItems": 100,
+            "propertyOrder": 8,
+            "options": {
+                "disable_array_delete_last_row": true
+            },
+            "items": {
+                "type": "object",
+                "title": "Command",
+                "headerTemplate": "/{{self.name}} — {{self.description}}",
+                "required": ["name", "description"],
+                "options": {
+                    "disable_edit_json": true,
+                    "disable_properties": true
+                },
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "title": "Command",
+                        "description": "command_name_description",
+                        "pattern": "^[a-z0-9_]{1,32}$",
+                        "not": {
+                            "enum": ["start", "help"]
+                        },
+                        "options": {
+                            "patternmessage": "Only a-z, 0-9 and _, up to 32 characters"
+                        },
+                        "propertyOrder": 1
+                    },
+                    "description": {
+                        "type": "string",
+                        "title": "Description",
+                        "description": "command_description_description",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "propertyOrder": 2
+                    },
+                    "users": {
+                        "type": "array",
+                        "title": "Allowed Users",
+                        "description": "allowed_users_description",
+                        "_format": "table",
+                        "uniqueItems": true,
+                        "propertyOrder": 3,
+                        "options": {
+                            "disable_array_reorder": true,
+                            "disable_array_delete_last_row": true
+                        },
+                        "items": {
+                            "type": "string",
+                            "title": "User",
+                            "watch": {
+                                "users": "root.users"
+                            },
+                            "enumSource": [
+                                {
+                                    "source": "users",
+                                    "title": "{{item.name}}",
+                                    "value": "{{item.name}}"
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    },
+
+    "translations": {
+        "en": {
+            "wb-telegram_description": "Telegram bot: commands are published to MQTT controls of the telegram_bot device, wb-rules reply via the send control",
+            "token_description": "Leave empty to keep the current token. The token is never shown here",
+            "delete_token_description": "Removes the saved token; the bot stops until a new one is set",
+            "reply_timeout_description": "If a rule does not reply in time, the user is told so. Older commands are not executed",
+            "users_description": "Only these chats can use the bot. Unknown users get their chat_id in reply",
+            "commands_description": "Each command gets the control cmd_<name>; a rule must react to it",
+            "command_name_description": "Without the slash: gate, boiler_status",
+            "command_description_description": "Shown in the Telegram command menu",
+            "allowed_users_description": "Empty list means everyone"
+        },
+        "ru": {
+            "Telegram Bot": "Telegram-бот",
+            "wb-telegram_description": "Telegram-бот: команды публикуются в MQTT-контролы устройства telegram_bot, правила wb-rules отвечают через контрол send",
+            "Enable Bot": "Бот включён",
+            "Bot Token": "Токен бота",
+            "token_description": "Оставьте пустым, чтобы не менять текущий токен. Токен здесь никогда не показывается",
+            "Invalid token format": "Неверный формат токена",
+            "Token Status": "Токен",
+            "Set": "Задан",
+            "Not Set": "Не задан",
+            "Delete Token": "Удалить токен",
+            "delete_token_description": "Удаляет сохранённый токен; бот остановится, пока не задан новый",
+            "Rule Reply Timeout (s)": "Таймаут ответа правила, с",
+            "reply_timeout_description": "Если правило не ответило вовремя, пользователь узнает об этом. Более старые команды не выполняются",
+            "Debug Logging": "Отладочный лог",
+            "Users": "Пользователи",
+            "users_description": "Пользоваться ботом могут только эти чаты. Незнакомому пользователю бот ответит его chat_id",
+            "User": "Пользователь",
+            "Name": "Имя",
+            "Chat ID": "Chat ID",
+            "System Notifications": "Системные уведомления",
+            "Commands": "Команды",
+            "commands_description": "Для каждой команды создаётся контрол cmd_<имя>; реагировать на него должно правило",
+            "Command": "Команда",
+            "command_name_description": "Без слеша: gate, boiler_status",
+            "Only a-z, 0-9 and _, up to 32 characters": "Только a-z, 0-9 и _, не длиннее 32 символов",
+            "Description": "Описание",
+            "command_description_description": "Показывается в меню команд Telegram",
+            "Allowed Users": "Кому доступно",
+            "allowed_users_description": "Пустой список — всем"
+        }
+    }
+}

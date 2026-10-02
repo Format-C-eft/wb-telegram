@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  # Ветки: тесты и lint изменений — обязательная проверка «Тесты и линт» для PR в master.
+  # master (слияние PR): тесты и полный lint для информации, затем релиз.
+  # Слияние, меняющее только документацию, релиз не выпускает (job «Версия релиза»).
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Новый push в ветку отменяет устаревший прогон; сборки master не прерываются.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  test:
+    name: Тесты и линт
+    if: github.ref != 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Для lint изменений нужна история и origin/master.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+
+      - name: Тесты
+        run: make test
+
+      - name: Lint изменений
+        run: make lint
+
+  # Информационная проверка master: не блокирует релиз, показывает, что поправить в следующих версиях.
+  report:
+    name: Тесты и полный линт (информационно)
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+
+      - name: Тесты
+        id: test
+        continue-on-error: true
+        run: make test
+
+      - name: Полный lint
+        id: lint
+        continue-on-error: true
+        run: make lint-full
+
+      - name: Итог
+        if: always()
+        env:
+          TEST: ${{ steps.test.outcome }}
+          LINT: ${{ steps.lint.outcome }}
+        run: |
+          {
+            echo "### Состояние master"
+            echo "- Тесты: ${TEST}"
+            echo "- Полный lint: ${LINT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$TEST" != "success" ] || [ "$LINT" != "success" ]; then
+            echo "::warning::master: тесты — ${TEST}, полный lint — ${LINT}. Поправить в следующих релизах."
+          fi
+
+  version:
+    name: Версия релиза
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.changes.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Релиз нужен, только если слияние меняет что-то кроме документации.
+      - id: changes
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -z "$BEFORE" ] || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff --name-only "$BEFORE" "$GITHUB_SHA" | grep -vE '(\.md$|^docs/|^LICENSE$)' | grep -q .; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Мажор и минор — из debian/changelog, патч — номер запуска CI: каждая сборка master новее предыдущей.
+      - id: version
+        run: |
+          base=$(sed -n '1s/.*(\([0-9]*\.[0-9]*\)\..*).*/\1/p' debian/changelog)
+          echo "version=${base}.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Пакет ${{ matrix.arch }}
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    container: golang:1.26-trixie
+    strategy:
+      matrix:
+        arch: [arm64, armhf]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Инструменты сборки
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends debhelper dpkg-dev \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabihf
+
+      - name: Сборка
+        run: scripts/build-deb.sh ${{ matrix.arch }} ${{ needs.version.outputs.version }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    name: Релиз
+    needs: [version, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency: release
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+
+      # Файлы без версии в имени нужны для ссылок releases/latest/download/... в install.sh.
+      - name: Публикация
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          for arch in arm64 armhf; do
+            cp "dist/wb-telegram_${VERSION}_${arch}.deb" "dist/wb-telegram_${arch}.deb"
+          done
+          cp scripts/install.sh dist/install.sh
+
+          gh release create "v${VERSION}" \
+            --target "${GITHUB_SHA}" \
+            --title "wb-telegram ${VERSION}" \
+            --notes "Установка и обновление на контроллере: \`curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.sh | sh\`. arm64 — WB8, armhf — WB6/WB7." \
+            --latest \
+            dist/*.deb dist/install.sh

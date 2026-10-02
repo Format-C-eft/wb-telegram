@@ -1,0 +1,17 @@
+Source: wb-telegram
+Maintainer: Format_C_eft <87527599+Format-C-eft@users.noreply.github.com>
+Section: misc
+Priority: optional
+Standards-Version: 4.5.1
+Build-Depends: debhelper-compat (= 13),
+               golang-1.26-go:native
+Homepage: https://github.com/Format-C-eft/wb-telegram
+
+Package: wb-telegram
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends}
+Description: Telegram bot for Wiren Board controllers
+ wb-telegram publishes Telegram bot commands to MQTT controls of the
+ telegram_bot device and delivers messages written by wb-rules to the
+ send control. Settings are edited in the Wiren Board web interface.
