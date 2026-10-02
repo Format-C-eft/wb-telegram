@@ -23,6 +23,16 @@ const (
 	DefaultReplyTimeoutS = 10
 	// MaxReplyTimeoutS — максимальный таймаут ответа правила, с.
 	MaxReplyTimeoutS = 300
+	// DefaultConnectTimeoutS — таймаут подключения к Telegram (TCP и TLS) по умолчанию, с.
+	DefaultConnectTimeoutS = 30
+	// MinConnectTimeoutS — минимальный таймаут подключения к Telegram, с.
+	MinConnectTimeoutS = 5
+	// MaxConnectTimeoutS — максимальный таймаут подключения к Telegram, с.
+	MaxConnectTimeoutS = 120
+	// DefaultPollTimeoutS — таймаут long polling getUpdates по умолчанию, с.
+	DefaultPollTimeoutS = 30
+	// MaxPollTimeoutS — максимальный таймаут long polling, с (ограничение Telegram — 50).
+	MaxPollTimeoutS = 50
 	// MaxCommands — лимит команд Telegram.
 	MaxCommands = 100
 	// maxDescriptionRunes — лимит длины описания команды Telegram.
@@ -51,11 +61,13 @@ type Command struct {
 
 // Config — конфигурация сервиса в том виде, в котором она лежит на диске.
 type Config struct {
-	Enabled       bool      `json:"enabled"`
-	ReplyTimeoutS int       `json:"reply_timeout_s"`
-	Debug         bool      `json:"debug"`
-	Users         []User    `json:"users"`
-	Commands      []Command `json:"commands"`
+	Enabled         bool      `json:"enabled"`
+	ConnectTimeoutS int       `json:"connect_timeout_s"`
+	PollTimeoutS    int       `json:"poll_timeout_s"`
+	ReplyTimeoutS   int       `json:"reply_timeout_s"`
+	Debug           bool      `json:"debug"`
+	Users           []User    `json:"users"`
+	Commands        []Command `json:"commands"`
 }
 
 // Load читает конфиг с диска; отсутствующий файл даёт выключенный конфиг по умолчанию.
@@ -110,6 +122,14 @@ func (c *Config) applyDefaults() {
 		c.ReplyTimeoutS = DefaultReplyTimeoutS
 	}
 
+	if c.ConnectTimeoutS == 0 {
+		c.ConnectTimeoutS = DefaultConnectTimeoutS
+	}
+
+	if c.PollTimeoutS == 0 {
+		c.PollTimeoutS = DefaultPollTimeoutS
+	}
+
 	if c.Users == nil {
 		c.Users = []User{}
 	}
@@ -131,6 +151,14 @@ func (c *Config) Validate() error {
 
 	if c.ReplyTimeoutS < 1 || c.ReplyTimeoutS > MaxReplyTimeoutS {
 		problems = append(problems, fmt.Sprintf("reply_timeout_s должен быть от 1 до %d", MaxReplyTimeoutS))
+	}
+
+	if c.ConnectTimeoutS < MinConnectTimeoutS || c.ConnectTimeoutS > MaxConnectTimeoutS {
+		problems = append(problems, fmt.Sprintf("connect_timeout_s должен быть от %d до %d", MinConnectTimeoutS, MaxConnectTimeoutS))
+	}
+
+	if c.PollTimeoutS < 1 || c.PollTimeoutS > MaxPollTimeoutS {
+		problems = append(problems, fmt.Sprintf("poll_timeout_s должен быть от 1 до %d", MaxPollTimeoutS))
 	}
 
 	problems = append(problems, c.validateUsers()...)
@@ -229,6 +257,16 @@ func (c *Config) validateCommandUsers(cmd Command) []string {
 	}
 
 	return problems
+}
+
+// ConnectTimeout возвращает таймаут подключения к Telegram (TCP и TLS).
+func (c *Config) ConnectTimeout() time.Duration {
+	return time.Duration(c.ConnectTimeoutS) * time.Second
+}
+
+// PollTimeout возвращает таймаут long polling getUpdates.
+func (c *Config) PollTimeout() time.Duration {
+	return time.Duration(c.PollTimeoutS) * time.Second
 }
 
 // ReplyTimeout возвращает таймаут ответа правила.

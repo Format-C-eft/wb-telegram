@@ -14,8 +14,10 @@ import (
 // validConfig возвращает корректный конфиг для тестов.
 func validConfig() *Config {
 	return &Config{
-		Enabled:       true,
-		ReplyTimeoutS: 10,
+		Enabled:         true,
+		ConnectTimeoutS: 30,
+		PollTimeoutS:    30,
+		ReplyTimeoutS:   10,
 		Users: []User{
 			{Name: "Супруга", ChatID: 100, Notifications: true},
 			{Name: "Ребёнок", ChatID: 200},
@@ -39,6 +41,10 @@ func TestValidate(t *testing.T) {
 		{name: "valid", mutate: func(*Config) {}},
 		{name: "timeout too small", mutate: func(c *Config) { c.ReplyTimeoutS = 0 }, wantErr: "reply_timeout_s"},
 		{name: "timeout too big", mutate: func(c *Config) { c.ReplyTimeoutS = 301 }, wantErr: "reply_timeout_s"},
+		{name: "connect timeout too small", mutate: func(c *Config) { c.ConnectTimeoutS = 4 }, wantErr: "connect_timeout_s"},
+		{name: "connect timeout too big", mutate: func(c *Config) { c.ConnectTimeoutS = 121 }, wantErr: "connect_timeout_s"},
+		{name: "poll timeout too small", mutate: func(c *Config) { c.PollTimeoutS = -1 }, wantErr: "poll_timeout_s"},
+		{name: "poll timeout too big", mutate: func(c *Config) { c.PollTimeoutS = 51 }, wantErr: "poll_timeout_s"},
 		{name: "empty user name", mutate: func(c *Config) { c.Users[0].Name = " " }, wantErr: "имя пользователя"},
 		{name: "duplicate user name", mutate: func(c *Config) { c.Users[1].Name = "Супруга" }, wantErr: "повторяется имя пользователя"},
 		{name: "zero chat id", mutate: func(c *Config) { c.Users[0].ChatID = 0 }, wantErr: "chat_id"},
@@ -109,6 +115,10 @@ func TestParseDefaults(t *testing.T) {
 			}
 
 			if cfg.Enabled || cfg.ReplyTimeout() != 10*time.Second || cfg.Users == nil || cfg.Commands == nil {
+				t.Fatalf("unexpected default config: %+v", cfg)
+			}
+
+			if cfg.ConnectTimeout() != 30*time.Second || cfg.PollTimeout() != 30*time.Second {
 				t.Fatalf("unexpected default config: %+v", cfg)
 			}
 		})
