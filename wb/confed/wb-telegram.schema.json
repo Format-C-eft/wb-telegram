@@ -61,6 +61,26 @@
             "propertyOrder": 4
         },
 
+        "connect_timeout_s": {
+            "type": "integer",
+            "title": "Telegram Connect Timeout (s)",
+            "description": "connect_timeout_description",
+            "minimum": 5,
+            "maximum": 120,
+            "default": 30,
+            "propertyOrder": 5
+        },
+
+        "poll_timeout_s": {
+            "type": "integer",
+            "title": "Telegram Poll Timeout (s)",
+            "description": "poll_timeout_description",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 30,
+            "propertyOrder": 6
+        },
+
         "reply_timeout_s": {
             "type": "integer",
             "title": "Rule Reply Timeout (s)",
@@ -68,7 +88,7 @@
             "minimum": 1,
             "maximum": 300,
             "default": 10,
-            "propertyOrder": 5
+            "propertyOrder": 7
         },
 
         "debug": {
@@ -76,7 +96,7 @@
             "title": "Debug Logging",
             "_format": "checkbox",
             "default": false,
-            "propertyOrder": 6
+            "propertyOrder": 8
         },
 
         "users": {
@@ -84,7 +104,7 @@
             "title": "Users",
             "description": "users_description",
             "_format": "table",
-            "propertyOrder": 7,
+            "propertyOrder": 9,
             "options": {
                 "disable_array_reorder": true,
                 "disable_array_delete_last_row": true
@@ -122,7 +142,7 @@
             "description": "commands_description",
             "_format": "tabs",
             "maxItems": 100,
-            "propertyOrder": 8,
+            "propertyOrder": 10,
             "options": {
                 "disable_array_delete_last_row": true
             },
@@ -193,6 +213,8 @@
             "wb-telegram_description": "Telegram bot: commands are published to MQTT controls of the telegram_bot device, wb-rules reply via the send control",
             "token_description": "Leave empty to keep the current token. The token is never shown here",
             "delete_token_description": "Removes the saved token; the bot stops until a new one is set",
+            "connect_timeout_description": "Time for the TCP connection and TLS handshake with api.telegram.org. Increase it if the connection to Telegram is slow (logs show TLS handshake timeout)",
+            "poll_timeout_description": "How long one getUpdates request waits for new messages (long polling)",
             "reply_timeout_description": "If a rule does not reply in time, the user is told so. Older commands are not executed",
             "users_description": "Only these chats can use the bot. Unknown users get their chat_id in reply",
             "commands_description": "Each command gets the control cmd_<name>; a rule must react to it",
@@ -212,6 +234,10 @@
             "Not Set": "Не задан",
             "Delete Token": "Удалить токен",
             "delete_token_description": "Удаляет сохранённый токен; бот остановится, пока не задан новый",
+            "Telegram Connect Timeout (s)": "Таймаут подключения к Telegram, с",
+            "connect_timeout_description": "Время на TCP-соединение и TLS-рукопожатие с api.telegram.org. Увеличьте, если связь с Telegram медленная (в журнале TLS handshake timeout)",
+            "Telegram Poll Timeout (s)": "Таймаут опроса Telegram, с",
+            "poll_timeout_description": "Сколько один запрос getUpdates ждёт новых сообщений (long polling)",
             "Rule Reply Timeout (s)": "Таймаут ответа правила, с",
             "reply_timeout_description": "Если правило не ответило вовремя, пользователь узнает об этом. Более старые команды не выполняются",
             "Debug Logging": "Отладочный лог",

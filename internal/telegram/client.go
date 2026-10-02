@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,10 +18,10 @@ import (
 )
 
 const (
-	// pollTimeout — таймаут long polling getUpdates.
-	pollTimeout = 30 * time.Second
-	// httpTimeout — таймаут HTTP-запроса, больше pollTimeout.
-	httpTimeout = 35 * time.Second
+	// requestMargin — запас таймаута HTTP-запроса сверх подключения и long polling.
+	requestMargin = 10 * time.Second
+	// tcpKeepAlive — период TCP keep-alive: соединение с Bot API переиспользуется между запросами.
+	tcpKeepAlive = 30 * time.Second
 )
 
 // Message — входящее текстовое сообщение.
@@ -97,7 +98,7 @@ func New(token string, handler Handler, opts ...Option) (*Client, error) {
 	api, errNew := bot.New(token,
 		bot.WithSkipGetMe(),
 		bot.WithServerURL(o.serverURL),
-		bot.WithHTTPClient(pollTimeout, &http.Client{Timeout: httpTimeout}),
+		bot.WithHTTPClient(o.pollTimeout, newHTTPClient(o.connectTimeout, o.pollTimeout)),
 		bot.WithAllowedUpdates(bot.AllowedUpdates{"message"}),
 		bot.WithDefaultHandler(c.dispatch(handler)),
 		bot.WithErrorsHandler(c.onPollError),
@@ -234,6 +235,21 @@ func (c *Client) undelivered() int {
 	}
 
 	return lost
+}
+
+// newHTTPClient собирает HTTP-клиент для Bot API: стандартный транспорт с таймаутами
+// подключения и TLS-рукопожатия connect (у стандартного — 10 с, на медленных каналах
+// рукопожатие с api.telegram.org бывает дольше) и общим таймаутом запроса, который
+// покрывает подключение, long polling и ответ.
+func newHTTPClient(connect, poll time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: connect, KeepAlive: tcpKeepAlive}).DialContext
+	transport.TLSHandshakeTimeout = connect
+
+	return &http.Client{
+		Timeout:   connect + poll + requestMargin,
+		Transport: transport,
+	}
 }
 
 // Stop останавливает клиента с таймаутом досылки 5 секунд.

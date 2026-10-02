@@ -25,7 +25,7 @@ func (b *Bot) HandleSend(payload []byte) {
 		return
 	}
 
-	req, errParse := parseSendRequest(payload)
+	req, errParse := parseSendRequest(fixCESU8(payload))
 	if errParse != nil {
 		slog.Warn("send: сообщение от правил проигнорировано", "err", errParse, "payload", string(payload))
 
