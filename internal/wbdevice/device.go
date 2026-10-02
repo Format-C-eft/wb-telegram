@@ -97,7 +97,7 @@ func New(deviceID string, opts ...Option) (*Device, error) {
 
 	for _, control := range o.controls {
 		d.controls[control.ID] = control
-		d.values[control.ID] = ""
+		d.values[control.ID] = control.Initial
 		d.errors[control.ID] = ""
 	}
 
@@ -167,6 +167,11 @@ func (d *Device) onConnect(_ paho.Client) {
 		errSetup := d.setup(generation)
 		if errSetup == nil {
 			break
+		}
+
+		// Остановка или новое подключение во время публикации — не ошибка.
+		if d.isStopped() || !d.isCurrent(generation) {
+			return
 		}
 
 		slog.Error("MQTT: не удалось опубликовать устройство, повторю", "err", errSetup, "delay", delay)
@@ -305,7 +310,8 @@ func (d *Device) publishState() error {
 }
 
 // publishControl публикует meta, текущее значение и флаг ошибки контрола.
-// Значение Volatile-контрола при (пере)подключении сбрасывается в "" и не повторяется.
+// Значение Volatile-контрола при (пере)подключении возвращается к Initial и не повторяется;
+// пустое значение не публикуется (см. Control.Initial).
 func (d *Device) publishControl(control Control) error {
 	meta, errMarshal := json.Marshal(control.Meta)
 	if errMarshal != nil {
@@ -316,7 +322,7 @@ func (d *Device) publishControl(control Control) error {
 	defer d.mu.Unlock()
 
 	if control.Volatile {
-		d.values[control.ID] = ""
+		d.values[control.ID] = control.Initial
 	}
 
 	errMeta := d.publish(controlMetaTopic(d.id, control.ID), string(meta))
@@ -324,9 +330,11 @@ func (d *Device) publishControl(control Control) error {
 		return errMeta
 	}
 
-	errValue := d.publish(controlTopic(d.id, control.ID), d.values[control.ID])
-	if errValue != nil {
-		return errValue
+	if d.values[control.ID] != "" {
+		errValue := d.publish(controlTopic(d.id, control.ID), d.values[control.ID])
+		if errValue != nil {
+			return errValue
+		}
 	}
 
 	return d.publish(controlErrorTopic(d.id, control.ID), d.errors[control.ID])
@@ -399,7 +407,7 @@ func (d *Device) SetValue(controlID, value string) error {
 
 	errPublish := d.publish(controlTopic(d.id, controlID), value)
 	if errPublish != nil {
-		d.values[controlID] = ""
+		d.values[controlID] = d.controls[controlID].Initial
 	}
 
 	return errPublish
@@ -417,6 +425,16 @@ func (d *Device) SetError(controlID, flags string) error {
 	d.errors[controlID] = flags
 
 	return d.publish(controlErrorTopic(d.id, controlID), flags)
+}
+
+// isStopped сообщает, что устройство останавливается.
+func (d *Device) isStopped() bool {
+	select {
+	case <-d.stop:
+		return true
+	default:
+		return false
+	}
 }
 
 // Connected сообщает, что устройство подключено к брокеру, опубликовано и принимает записи в /on.

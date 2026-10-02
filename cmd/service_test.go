@@ -352,8 +352,9 @@ func startService(t *testing.T, tg *fakeTelegram, config string) *runningService
 	svc := &runningService{rule: connectClient(t, broker, "rule"), calls: make(chan string, 16), done: make(chan int, 1)}
 
 	subscribe(t, svc.rule, "/devices/telegram_bot/controls/cmd_gate", func(_ paho.Client, m paho.Message) {
-		if len(m.Payload()) > 0 {
-			svc.calls <- string(m.Payload())
+		// Как модуль telegram.js: заглушку "{}" без id правило игнорирует.
+		if payload := string(m.Payload()); payload != "" && payload != "{}" {
+			svc.calls <- payload
 		}
 	})
 	subscribe(t, svc.rule, "/devices/telegram_bot/meta/error", func(_ paho.Client, m paho.Message) {
