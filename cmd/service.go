@@ -101,6 +101,7 @@ func runBot(ctx context.Context, cfg *config.Config, token, broker, apiURL strin
 	}
 
 	telegramOptions := []telegram.Option{
+		telegram.WithTimeouts(cfg.ConnectTimeout(), cfg.PollTimeout()),
 		telegram.WithOnFatal(application.Terminate),
 		telegram.WithOnDelivery(func(err error) { core.ReportDelivery(err) }),
 	}

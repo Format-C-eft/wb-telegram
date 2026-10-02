@@ -13,6 +13,8 @@ type Option func(*options)
 // options — настройки Client.
 type options struct {
 	serverURL       string
+	connectTimeout  time.Duration
+	pollTimeout     time.Duration
 	queueSize       int
 	perChatInterval time.Duration
 	globalInterval  time.Duration
@@ -27,6 +29,8 @@ type options struct {
 func defaultOptions() options {
 	return options{
 		serverURL:       "https://api.telegram.org",
+		connectTimeout:  30 * time.Second,
+		pollTimeout:     30 * time.Second,
 		queueSize:       100,
 		perChatInterval: time.Second,
 		globalInterval:  34 * time.Millisecond,
@@ -43,6 +47,8 @@ func (o options) Validate() error {
 	switch {
 	case o.serverURL == "":
 		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "server url is required"}
+	case o.connectTimeout <= 0 || o.pollTimeout <= 0:
+		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "timeouts must be positive"}
 	case o.queueSize < 1:
 		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "queue size must be positive"}
 	case o.perChatInterval < 0 || o.globalInterval < 0:
@@ -59,6 +65,14 @@ func (o options) Validate() error {
 // WithServerURL задаёт адрес Bot API (для тестов — httptest.Server).
 func WithServerURL(url string) Option {
 	return func(o *options) { o.serverURL = url }
+}
+
+// WithTimeouts задаёт таймаут подключения к Bot API (TCP и TLS) и таймаут long polling getUpdates.
+func WithTimeouts(connect, poll time.Duration) Option {
+	return func(o *options) {
+		o.connectTimeout = connect
+		o.pollTimeout = poll
+	}
 }
 
 // WithQueueSize задаёт ёмкость исходящей очереди.

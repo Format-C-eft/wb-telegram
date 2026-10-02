@@ -60,6 +60,10 @@ type Device struct {
 
 	// staleOnce ограничивает уборку устаревших контролов одним разом за время жизни процесса.
 	staleOnce sync.Once
+
+	// flagMu упорядочивает постановку в очередь флага ошибки устройства: "" в конце setup и "r"
+	// в Shutdown. Пустой флаг от устаревшего соединения не может уйти после "r".
+	flagMu sync.Mutex
 }
 
 // New создаёт устройство deviceID; подключение — в Run.
@@ -118,7 +122,7 @@ func New(deviceID string, opts ...Option) (*Device, error) {
 // устройства), пока устройство будет опубликовано и начнёт принимать записи в /on: компоненты,
 // запущенные после него, застают устройство готовым. Если брокер пока недоступен или публикация
 // затянулась, подключение продолжается в фоне, а Connected остаётся false до готовности.
-func (d *Device) Run(_ context.Context) error {
+func (d *Device) Run(ctx context.Context) error {
 	d.workers.Add(1)
 
 	go d.dispatchWrites()
@@ -130,6 +134,8 @@ func (d *Device) Run(_ context.Context) error {
 
 	select {
 	case <-token.Done():
+	case <-ctx.Done():
+		return nil
 	case <-deadline.C:
 		slog.Warn("MQTT: брокер пока недоступен, подключение продолжится в фоне", "broker", d.options.broker)
 
@@ -143,6 +149,7 @@ func (d *Device) Run(_ context.Context) error {
 	select {
 	case <-d.firstReady:
 	case <-d.stop:
+	case <-ctx.Done():
 	case <-deadline.C:
 		slog.Warn("MQTT: устройство ещё не опубликовано, продолжаю в фоне", "device", d.id)
 	}
@@ -157,7 +164,7 @@ func (d *Device) onConnect(_ paho.Client) {
 	delay := setupRetryMin
 
 	for {
-		errSetup := d.setup()
+		errSetup := d.setup(generation)
 		if errSetup == nil {
 			break
 		}
@@ -189,7 +196,7 @@ func (d *Device) onConnect(_ paho.Client) {
 //
 // Уборка идёт до подписки на /on: её подписка на controls/# перекрывала бы подписки на /on,
 // и запись в контрол могла бы дойти до обработчика дважды.
-func (d *Device) setup() error {
+func (d *Device) setup(generation uint64) error {
 	errPublish := d.publishState()
 	if errPublish != nil {
 		return errPublish
@@ -202,7 +209,30 @@ func (d *Device) setup() error {
 		return errSubscribe
 	}
 
-	return d.publish(deviceErrorTopic(d.id), "")
+	return d.publishHealthy(generation)
+}
+
+// publishHealthy снимает флаг ошибки устройства, если соединение generation всё ещё текущее.
+// Постановка в очередь идёт под flagMu, как и "r" в Shutdown, а paho отправляет сообщения
+// в порядке постановки: после остановки пустой флаг не перезапишет "r".
+func (d *Device) publishHealthy(generation uint64) error {
+	d.flagMu.Lock()
+
+	if !d.isCurrent(generation) {
+		d.flagMu.Unlock()
+
+		return nil
+	}
+
+	token, errEnqueue := d.enqueue(deviceErrorTopic(d.id), "")
+
+	d.flagMu.Unlock()
+
+	if errEnqueue != nil {
+		return errEnqueue
+	}
+
+	return waitPublished(token, deviceErrorTopic(d.id), d.options.timeout)
 }
 
 // onConnectionLost снимает признак готовности; переподключение paho выполняет сам.
@@ -400,7 +430,6 @@ func (d *Device) Connected() bool {
 // Вызывать из WriteHandler нельзя.
 func (d *Device) Shutdown(ctx context.Context) error {
 	d.stopOnce.Do(func() { close(d.stop) })
-	d.nextGeneration()
 
 	timeout := d.options.timeout
 
@@ -410,8 +439,16 @@ func (d *Device) Shutdown(ctx context.Context) error {
 
 	var errPublish error
 
-	if d.client.IsConnectionOpen() {
-		errPublish = d.publishWithin(deviceErrorTopic(d.id), ErrorFlagRead, timeout)
+	d.flagMu.Lock()
+
+	d.nextGeneration()
+
+	token, errEnqueue := d.enqueue(deviceErrorTopic(d.id), ErrorFlagRead)
+
+	d.flagMu.Unlock()
+
+	if errEnqueue == nil {
+		errPublish = waitPublished(token, deviceErrorTopic(d.id), timeout)
 	}
 
 	d.client.Disconnect(250)
@@ -432,11 +469,25 @@ func (d *Device) publish(topic, payload string) error {
 
 // publishWithin публикует retained-сообщение с QoS 1 и ждёт подтверждения не дольше timeout.
 func (d *Device) publishWithin(topic, payload string, timeout time.Duration) error {
-	if !d.client.IsConnectionOpen() {
-		return &Error{kind: kindNotConnected, Op: "publish", Topic: topic, Message: "no connection to broker"}
+	token, errEnqueue := d.enqueue(topic, payload)
+	if errEnqueue != nil {
+		return errEnqueue
 	}
 
-	token := d.client.Publish(topic, 1, true, payload)
+	return waitPublished(token, topic, timeout)
+}
+
+// enqueue ставит retained-сообщение с QoS 1 в очередь отправки paho.
+func (d *Device) enqueue(topic, payload string) (paho.Token, error) {
+	if !d.client.IsConnectionOpen() {
+		return nil, &Error{kind: kindNotConnected, Op: "publish", Topic: topic, Message: "no connection to broker"}
+	}
+
+	return d.client.Publish(topic, 1, true, payload), nil
+}
+
+// waitPublished ждёт подтверждения публикации не дольше timeout.
+func waitPublished(token paho.Token, topic string, timeout time.Duration) error {
 	if !token.WaitTimeout(timeout) {
 		return &Error{kind: kindTimeout, Op: "publish", Topic: topic, Message: "no answer from broker"}
 	}
