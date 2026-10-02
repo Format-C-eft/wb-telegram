@@ -49,7 +49,9 @@ else
 	wget -q -O "$tmp/wb-telegram.deb" "$url"
 fi
 
-dpkg -i "$tmp/wb-telegram.deb"
+# Настройки из формы (/etc/wb-telegram.conf) сохраняются без вопросов dpkg:
+# через `curl | sh` ответить на них нельзя, а новые поля бот подставляет сам.
+dpkg -i --force-confdef --force-confold "$tmp/wb-telegram.deb"
 
 echo
 echo "Установлено: $(dpkg-query -W -f '${Version}' wb-telegram)."
