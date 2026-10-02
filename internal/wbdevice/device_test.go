@@ -19,7 +19,7 @@ import (
 func testControls() []Control {
 	return []Control{
 		{ID: "send", Meta: ControlMeta{Type: ControlTypeText, Title: map[string]string{"en": "Message", "ru": "Сообщение"}, Order: 1}},
-		{ID: "cmd_gate", Meta: ControlMeta{Type: ControlTypeText, Title: map[string]string{"en": "/gate", "ru": "Ворота"}, Order: 2, Readonly: true}, Volatile: true},
+		{ID: "cmd_gate", Meta: ControlMeta{Type: ControlTypeText, Title: map[string]string{"en": "/gate", "ru": "Ворота"}, Order: 2, Readonly: true}, Initial: "{}", Volatile: true},
 	}
 }
 
@@ -104,10 +104,10 @@ func TestDevicePublishesInitialState(t *testing.T) {
 		return ok && value == `{"type":"text","title":{"en":"/gate","ru":"Ворота"},"order":2,"readonly":true}`
 	})
 
-	waitFor(t, "stale command value cleared", func() bool {
+	waitFor(t, "stale command value replaced by placeholder", func() bool {
 		value, ok := obs.get("/devices/telegram_bot/controls/cmd_gate")
 
-		return ok && value == ""
+		return ok && value == "{}"
 	})
 
 	waitFor(t, "device error cleared", func() bool {
@@ -176,7 +176,7 @@ func TestDeviceSetValueAndError(t *testing.T) {
 }
 
 // TestDeviceReconnect проверяет, что после обрыва связи устройство заново публикует состояние и подписку на /on:
-// обычный контрол — с последним значением, Volatile-контрол (вызов команды) — пустым, чтобы вызов не повторился.
+// обычный контрол — с последним значением, Volatile-контрол (вызов команды) — с заглушкой Initial, чтобы вызов не повторился.
 func TestDeviceReconnect(t *testing.T) {
 	t.Parallel()
 
@@ -226,10 +226,10 @@ func TestDeviceReconnect(t *testing.T) {
 		return obs.count("/devices/telegram_bot/meta/error") > errorCount && value == ""
 	})
 
-	waitFor(t, "command value republished empty", func() bool {
+	waitFor(t, "command value republished as placeholder", func() bool {
 		value, _ := obs.get("/devices/telegram_bot/controls/cmd_gate")
 
-		return obs.count("/devices/telegram_bot/controls/cmd_gate") > valueCount && value == ""
+		return obs.count("/devices/telegram_bot/controls/cmd_gate") > valueCount && value == "{}"
 	})
 
 	waitFor(t, "send value republished", func() bool {
@@ -349,8 +349,35 @@ func TestDeviceSetValueFailureNotReplayed(t *testing.T) {
 		return obs.count("/devices/telegram_bot/controls/cmd_gate") > 0
 	})
 
-	if value, _ := obs.get("/devices/telegram_bot/controls/cmd_gate"); value != "" {
-		t.Fatalf("value after connect = %q, want empty", value)
+	if value, _ := obs.get("/devices/telegram_bot/controls/cmd_gate"); value != "{}" {
+		t.Fatalf("value after connect = %q, want placeholder {}", value)
+	}
+}
+
+// TestDeviceEmptyValueNotPublished проверяет, что пустое значение контрола не публикуется:
+// пустое retained-сообщение удаляет значение, и wb-rules счёл бы контрол удалённым.
+func TestDeviceEmptyValueNotPublished(t *testing.T) {
+	t.Parallel()
+
+	broker := startBroker(t)
+	obs := newObserver(t, broker, "/devices/telegram_bot/#")
+
+	startDevice(t, broker, nil, testControls()...)
+
+	waitFor(t, "send meta published", func() bool {
+		_, ok := obs.get("/devices/telegram_bot/controls/send/meta")
+
+		return ok
+	})
+
+	waitFor(t, "command placeholder published", func() bool {
+		value, _ := obs.get("/devices/telegram_bot/controls/cmd_gate")
+
+		return value == "{}"
+	})
+
+	if count := obs.count("/devices/telegram_bot/controls/send"); count != 0 {
+		t.Fatalf("send value published %d times, want none while it is empty", count)
 	}
 }
 
