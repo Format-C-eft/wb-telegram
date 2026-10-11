@@ -48,6 +48,10 @@ func TestNewHTTPClientTimeouts(t *testing.T) {
 	if client.Timeout != 45*time.Second+25*time.Second+requestMargin {
 		t.Fatalf("Timeout = %v, want connect + poll + margin", client.Timeout)
 	}
+
+	if transport.HTTP2 == nil || transport.HTTP2.SendPingTimeout != maxPingInterval || transport.HTTP2.PingTimeout != 45*time.Second {
+		t.Fatalf("HTTP2 = %+v, want ping after %v and ping timeout 45s", transport.HTTP2, maxPingInterval)
+	}
 }
 
 // TestNewHTTPClientSlowHandshake проверяет, что рукопожатие дольше таймаута обрывается, а в пределах — проходит.
