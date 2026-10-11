@@ -51,6 +51,7 @@ func TestValidate(t *testing.T) {
 		{name: "duplicate chat id", mutate: func(c *Config) { c.Users[1].ChatID = 100 }, wantErr: "повторяется chat_id"},
 		{name: "bad command name", mutate: func(c *Config) { c.Commands[0].Name = "Gate!" }, wantErr: "имя команды"},
 		{name: "reserved command", mutate: func(c *Config) { c.Commands[0].Name = "help" }, wantErr: "зарезервирована"},
+		{name: "reserved status command", mutate: func(c *Config) { c.Commands[0].Name = "status" }, wantErr: "/status зарезервирована"},
 		{name: "duplicate command", mutate: func(c *Config) { c.Commands[1].Name = "gate" }, wantErr: "повторяется команда"},
 		{name: "empty description", mutate: func(c *Config) { c.Commands[0].Description = "" }, wantErr: "описание"},
 		{name: "long description", mutate: func(c *Config) { c.Commands[0].Description = strings.Repeat("я", 257) }, wantErr: "описание"},

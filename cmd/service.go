@@ -93,6 +93,7 @@ func runBot(ctx context.Context, cfg *config.Config, token, broker, apiURL strin
 				core.HandleSend(payload)
 			}
 		}),
+		wbdevice.WithOnConnection(func(ok bool) { core.ReportMQTT(ok) }),
 	)
 	if errDevice != nil {
 		slog.Error("не удалось создать MQTT-устройство", "err", errDevice)
@@ -104,6 +105,7 @@ func runBot(ctx context.Context, cfg *config.Config, token, broker, apiURL strin
 		telegram.WithTimeouts(cfg.ConnectTimeout(), cfg.PollTimeout()),
 		telegram.WithOnFatal(application.Terminate),
 		telegram.WithOnDelivery(func(err error) { core.ReportDelivery(err) }),
+		telegram.WithOnConnection(func(ok bool, reason string) { core.ReportTelegram(ok, reason) }),
 	}
 
 	if apiURL != "" {
@@ -121,7 +123,7 @@ func runBot(ctx context.Context, cfg *config.Config, token, broker, apiURL strin
 
 	var errCore error
 
-	core, errCore = bot.New(cfg, device, client)
+	core, errCore = bot.New(cfg, device, client, bot.WithVersion(version))
 	if errCore != nil {
 		slog.Error("не удалось создать ядро бота", "err", errCore)
 

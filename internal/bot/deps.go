@@ -17,4 +17,5 @@ type Publisher interface {
 type Sender interface {
 	Send(chatID int64, text string) error
 	SetCommands(ctx context.Context, chatID int64, commands []telegram.Command) error
+	Stats() telegram.Stats
 }

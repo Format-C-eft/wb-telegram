@@ -23,6 +23,7 @@ func (c *Client) Send(chatID int64, text string) error {
 	}
 
 	if dropped {
+		c.dropped.Add(1)
 		slog.Warn("Telegram: очередь отправки переполнена, самое старое сообщение выброшено")
 		c.options.onDelivery(ErrQueueFull)
 
@@ -79,6 +80,7 @@ func (c *Client) deliver(ctx context.Context, item outgoing) bool {
 
 		_, errSend := c.api.SendMessage(ctx, &bot.SendMessageParams{ChatID: item.chatID, Text: item.text})
 		if errSend == nil {
+			c.sent.Add(1)
 			c.markHealthy()
 			c.options.onDelivery(nil)
 
@@ -100,6 +102,7 @@ func (c *Client) deliver(ctx context.Context, item outgoing) bool {
 		c.options.onDelivery(failure)
 
 		if failure.kind == kindRejected {
+			c.dropped.Add(1)
 			c.markHealthy()
 			slog.Warn("Telegram: сообщение отклонено, не доставлено", "chat_id", item.chatID, "err", failure.Message)
 
@@ -108,6 +111,8 @@ func (c *Client) deliver(ctx context.Context, item outgoing) bool {
 
 		// Прочие неповторяемые ошибки — сообщение выбрасывается.
 		if failure.kind != kindRateLimited && failure.kind != kindTransient {
+			c.dropped.Add(1)
+
 			return true
 		}
 
@@ -122,6 +127,8 @@ func (c *Client) deliver(ctx context.Context, item outgoing) bool {
 // dropAfterFatal выбрасывает сообщение после отклонения токена: onDelivery(ErrUnauthorized)
 // сообщается один раз, а не на каждое сообщение. Вызывается только из цикла отправки.
 func (c *Client) dropAfterFatal() {
+	c.dropped.Add(1)
+
 	if c.fatalReported {
 		return
 	}

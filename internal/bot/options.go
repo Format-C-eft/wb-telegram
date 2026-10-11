@@ -19,6 +19,7 @@ type options struct {
 	pendingTTL time.Duration
 	retryBase  time.Duration
 	retryMax   time.Duration
+	version    string
 }
 
 // defaultOptions возвращает настройки по умолчанию.
@@ -33,6 +34,7 @@ func defaultOptions() options {
 		pendingTTL: time.Hour,
 		retryBase:  time.Second,
 		retryMax:   60 * time.Second,
+		version:    "dev",
 	}
 }
 
@@ -47,6 +49,11 @@ func (o options) Validate() error {
 	}
 
 	return nil
+}
+
+// WithVersion задаёт версию бота для служебных сообщений и /status.
+func WithVersion(version string) Option {
+	return func(o *options) { o.version = version }
 }
 
 // withClock подменяет источник текущего времени (для тестов).

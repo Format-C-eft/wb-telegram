@@ -43,7 +43,7 @@ const (
 var commandNamePattern = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
 
 // reservedCommands — команды, которые обрабатывает сам бот.
-var reservedCommands = []string{"start", "help"}
+var reservedCommands = []string{"start", "help", "status"}
 
 // User — член семьи, которому разрешено пользоваться ботом.
 type User struct {

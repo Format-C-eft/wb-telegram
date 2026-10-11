@@ -22,6 +22,7 @@ type options struct {
 	retryMax        time.Duration
 	onFatal         func(error)
 	onDelivery      func(error)
+	onConnection    func(ok bool, reason string)
 	sleep           func(ctx context.Context, d time.Duration) bool
 }
 
@@ -38,6 +39,7 @@ func defaultOptions() options {
 		retryMax:        60 * time.Second,
 		onFatal:         func(error) {},
 		onDelivery:      func(error) {},
+		onConnection:    func(bool, string) {},
 		sleep:           retry.Sleep,
 	}
 }
@@ -55,7 +57,7 @@ func (o options) Validate() error {
 		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "rate limits must not be negative"}
 	case o.retryBase <= 0 || o.retryMax < o.retryBase:
 		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "bad retry settings"}
-	case o.onFatal == nil || o.onDelivery == nil || o.sleep == nil:
+	case o.onFatal == nil || o.onDelivery == nil || o.onConnection == nil || o.sleep == nil:
 		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "callbacks must not be nil"}
 	}
 
@@ -73,6 +75,14 @@ func WithTimeouts(connect, poll time.Duration) Option {
 		o.connectTimeout = connect
 		o.pollTimeout = poll
 	}
+}
+
+// WithOnConnection задаёт реакцию на смену состояния связи с Bot API: ok=false с причиной
+// (замаскированный текст ошибки) при первой ошибке подряд, ok=true при восстановлении.
+// Вызывается на внутренних горутинах клиента: обработчик должен быть потокобезопасным,
+// не блокироваться и не вызывать Shutdown/Stop синхронно.
+func WithOnConnection(f func(ok bool, reason string)) Option {
+	return func(o *options) { o.onConnection = f }
 }
 
 // WithQueueSize задаёт ёмкость исходящей очереди.

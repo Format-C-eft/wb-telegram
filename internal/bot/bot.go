@@ -55,6 +55,10 @@ type Bot struct {
 	deliveryMu      sync.Mutex
 	deliveryFailing bool
 
+	// statsMu защищает stats; берётся после mu, никогда наоборот.
+	statsMu sync.Mutex
+	stats   serviceStats
+
 	done chan struct{}
 }
 
@@ -81,6 +85,7 @@ func New(cfg *config.Config, publisher Publisher, sender Sender, opts ...Option)
 		sender:    sender,
 		options:   o,
 		pending:   map[string]*pendingCall{},
+		stats:     serviceStats{startedAt: o.now()},
 		done:      make(chan struct{}),
 	}, nil
 }
@@ -112,6 +117,8 @@ func (b *Bot) Run(ctx context.Context) error {
 			b.syncUserCommands(runCtx, user)
 		}
 	}()
+
+	b.notifyService("\U0001F916 wb-telegram " + b.options.version + " запущен")
 
 	return nil
 }
@@ -149,6 +156,10 @@ func (b *Bot) isStopped() bool {
 // syncUserCommands устанавливает меню команд пользователю, повторяя при временных ошибках.
 func (b *Bot) syncUserCommands(ctx context.Context, user config.User) {
 	commands := toTelegramCommands(b.cfg.CommandsFor(user.Name))
+
+	if statusAllowed(user) {
+		commands = append(commands, telegram.Command{Name: statusCommand, Description: statusDescription})
+	}
 
 	for attempt := 0; ; attempt++ {
 		errSet := b.sender.SetCommands(ctx, user.ChatID, commands)

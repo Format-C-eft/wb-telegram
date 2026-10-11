@@ -15,6 +15,7 @@ type options struct {
 	title       map[string]string
 	controls    []Control
 	onWrite     WriteHandler
+	onConnected func(ok bool)
 	timeout     time.Duration
 	staleWindow time.Duration
 }
@@ -28,6 +29,7 @@ func defaultOptions() options {
 		title:       map[string]string{"en": "Telegram Bot", "ru": "Telegram-бот"},
 		timeout:     10 * time.Second,
 		staleWindow: time.Second,
+		onConnected: func(bool) {},
 	}
 }
 
@@ -40,6 +42,8 @@ func (o options) Validate() error {
 		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "client id is required"}
 	case o.driver == "":
 		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "driver is required"}
+	case o.onConnected == nil:
+		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "connection handler must not be nil"}
 	case o.timeout <= 0 || o.staleWindow <= 0:
 		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "timeouts must be positive"}
 	}
@@ -59,6 +63,13 @@ func (o options) Validate() error {
 	}
 
 	return nil
+}
+
+// WithOnConnection задаёт реакцию на связь с брокером: ok=true, когда устройство опубликовано
+// и готово (в том числе после переподключения), ok=false при потере связи. Вызывается на
+// горутинах paho: обработчик должен быть потокобезопасным и не блокироваться.
+func WithOnConnection(f func(ok bool)) Option {
+	return func(o *options) { o.onConnected = f }
 }
 
 // WithBroker задаёт адрес брокера (tcp://host:port или unix:///path).

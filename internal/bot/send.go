@@ -140,5 +140,7 @@ func (b *Bot) replyRecipient(id string) []int64 {
 	call.answered = true
 	call.stop()
 
+	b.countReply(id)
+
 	return []int64{call.chatID}
 }
