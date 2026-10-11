@@ -44,6 +44,12 @@ func (b *Bot) HandleMessage(_ context.Context, msg telegram.Message) {
 		return
 	}
 
+	if name == statusCommand && statusAllowed(user) {
+		b.deliver(msg.ChatID, b.statusText())
+
+		return
+	}
+
 	cmd, found := b.cfg.Command(name)
 	if !found || !b.cfg.Allowed(cmd, user.Name) {
 		b.deliver(msg.ChatID, "Неизвестная команда.\n\n"+b.helpText(user.Name))
@@ -54,6 +60,8 @@ func (b *Bot) HandleMessage(_ context.Context, msg telegram.Message) {
 	now := b.options.now()
 
 	if now.Sub(msg.Date) > b.cfg.ReplyTimeout() {
+		b.countStale()
+
 		sentAt := msg.Date.In(b.options.location).Format("15:04")
 		b.deliver(msg.ChatID, fmt.Sprintf("Команда /%s устарела (отправлена %s), повторите", name, sentAt))
 
@@ -96,6 +104,7 @@ func (b *Bot) publishCall(msg telegram.Message, userName, name, args string, now
 	}
 
 	b.startReplyTimer(id)
+	b.countCall(id, name, userName, now)
 
 	slog.Debug("команда опубликована", "command", name, "user", userName, "id", id)
 }
@@ -164,6 +173,7 @@ func (b *Bot) onReplyTimeout(id string) {
 
 	b.mu.Unlock()
 
+	b.countUnanswered()
 	b.deliver(chatID, fmt.Sprintf("Команда /%s отправлена, ответа от правил нет", command))
 }
 
@@ -194,15 +204,21 @@ func parseCommand(text string) (name, args string, ok bool) {
 // helpText возвращает список команд, доступных пользователю.
 func (b *Bot) helpText(userName string) string {
 	commands := b.cfg.CommandsFor(userName)
-	if len(commands) == 0 {
+	user, _ := b.cfg.UserByName(userName)
+
+	if len(commands) == 0 && !statusAllowed(user) {
 		return "Для вас пока нет доступных команд."
 	}
 
-	lines := make([]string, 0, len(commands)+1)
+	lines := make([]string, 0, len(commands)+2)
 	lines = append(lines, "Доступные команды:")
 
 	for _, cmd := range commands {
 		lines = append(lines, "/"+cmd.Name+" — "+cmd.Description)
+	}
+
+	if statusAllowed(user) {
+		lines = append(lines, "/"+statusCommand+" — "+statusDescription)
 	}
 
 	return strings.Join(lines, "\n")

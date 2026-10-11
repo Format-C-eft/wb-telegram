@@ -78,7 +78,7 @@ func TestHandleMessageHelp(t *testing.T) {
 		want   string
 	}{
 		{name: "help child", chatID: 200, text: "/help", want: "Доступные команды:\n/gate — Открыть ворота"},
-		{name: "start wife", chatID: 100, text: "/start", want: "Доступные команды:\n/gate — Открыть ворота\n/boiler — Состояние котла"},
+		{name: "start wife", chatID: 100, text: "/start", want: "Доступные команды:\n/gate — Открыть ворота\n/boiler — Состояние котла\n/status — Состояние бота"},
 		{name: "help with mention", chatID: 200, text: "/Help@MyHomeBot", want: "Доступные команды:\n/gate — Открыть ворота"},
 		{name: "plain text", chatID: 200, text: "привет", want: "Доступные команды:\n/gate — Открыть ворота"},
 		{name: "slash only", chatID: 200, text: "/", want: "Доступные команды:\n/gate — Открыть ворота"},
@@ -317,6 +317,7 @@ func TestRunGuards(t *testing.T) {
 
 			b, deps := newTestBot(t)
 			deps.sender.EXPECT().SetCommands(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			deps.sender.EXPECT().Send(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 
 			if tt.stopFirst {
 				errStop := b.Stop()
@@ -362,8 +363,11 @@ func TestRunSyncsCommands(t *testing.T) {
 		return ctx.Err() == nil
 	}))
 
-	all := []telegram.Command{{Name: "gate", Description: "Открыть ворота"}, {Name: "boiler", Description: "Состояние котла"}}
+	// /status — в меню только у пользователя с системными уведомлениями.
+	all := []telegram.Command{{Name: "gate", Description: "Открыть ворота"}, {Name: "boiler", Description: "Состояние котла"}, {Name: "status", Description: "Состояние бота"}}
 	child := []telegram.Command{{Name: "gate", Description: "Открыть ворота"}}
+
+	deps.sender.EXPECT().Send(int64(100), "\U0001F916 wb-telegram dev запущен").Return(nil)
 
 	rateLimited := *telegram.ErrRateLimited
 	rateLimited.RetryAfter = 5 * time.Second
@@ -419,6 +423,7 @@ func TestRunSkipsPermanentErrors(t *testing.T) {
 				deps.sender.EXPECT().SetCommands(gomock.Any(), int64(100), gomock.Any()).Return(tt.err),
 				deps.sender.EXPECT().SetCommands(gomock.Any(), int64(200), gomock.Any()).Return(nil),
 			)
+			deps.sender.EXPECT().Send(int64(100), gomock.Any()).Return(nil)
 
 			errRun := b.Run(context.Background())
 			if errRun != nil {
@@ -451,6 +456,7 @@ func TestStopCancelsRun(t *testing.T) {
 	}))
 
 	deps.sender.EXPECT().SetCommands(gomock.Any(), int64(100), gomock.Any()).Return(telegram.ErrTransient)
+	deps.sender.EXPECT().Send(int64(100), gomock.Any()).Return(nil)
 
 	errRun := b.Run(context.Background())
 	if errRun != nil {

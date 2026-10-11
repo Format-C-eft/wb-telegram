@@ -441,8 +441,9 @@ func TestRunServiceEndToEnd(t *testing.T) {
 		return slices.Contains(tg.sentMessages(), "100:Открываю")
 	})
 
-	if sent := tg.sentMessages(); len(sent) != 1 {
-		t.Fatalf("sent = %v, want only the reply", sent)
+	// Пользователь 100 с системными уведомлениями получает служебное «запущен» и ответ правила.
+	if sent := tg.sentMessages(); !slices.Equal(sent, []string{"100:\U0001F916 wb-telegram dev запущен", "100:Открываю"}) {
+		t.Fatalf("sent = %v, want start notice and the reply", sent)
 	}
 
 	svc.stopAndWait(t, 10*time.Second)
@@ -478,4 +479,26 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	}
 
 	t.Fatalf("timeout waiting for %s", what)
+}
+
+// TestRunServiceStatusCommand проверяет встроенную команду /status через весь сервис.
+func TestRunServiceStatusCommand(t *testing.T) {
+	t.Parallel()
+
+	tg := &fakeTelegram{}
+	svc := startService(t, tg, `{"enabled": true, "users": [{"name": "Я", "chat_id": 100, "notifications": true}]}`)
+
+	tg.pushUpdate(7, 100, "/status")
+
+	waitUntil(t, "status reply", func() bool {
+		for _, sent := range tg.sentMessages() {
+			if strings.HasPrefix(sent, "100:\U0001F916 wb-telegram dev\nРаботает") && strings.Contains(sent, "MQTT: ✅ подключено") {
+				return true
+			}
+		}
+
+		return false
+	})
+
+	svc.stopAndWait(t, 10*time.Second)
 }

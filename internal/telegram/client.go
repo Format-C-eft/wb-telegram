@@ -54,6 +54,10 @@ type Client struct {
 	failing atomic.Bool
 	fatal   atomic.Bool
 
+	// sent и dropped — счётчики доставленных и выброшенных сообщений для Stats.
+	sent    atomic.Uint64
+	dropped atomic.Uint64
+
 	// fatalReported — onDelivery(ErrUnauthorized) уже отправлен; только для цикла отправки.
 	fatalReported bool
 	// lostInFlight — цикл отправки остановлен посреди доставки сообщения; пишется только циклом
@@ -366,6 +370,7 @@ func (c *Client) reportFatal(err *Error) {
 func (c *Client) markFailing(message string) {
 	if c.failing.CompareAndSwap(false, true) {
 		slog.Warn("Telegram: ошибка связи, повторяю в фоне", "err", message)
+		c.options.onConnection(false, message)
 
 		return
 	}
@@ -377,6 +382,29 @@ func (c *Client) markFailing(message string) {
 func (c *Client) markHealthy() {
 	if c.failing.CompareAndSwap(true, false) {
 		slog.Info("Telegram: связь восстановлена")
+		c.options.onConnection(true, "")
+	}
+}
+
+// Stats — счётчики клиента с момента запуска.
+type Stats struct {
+	// Sent — доставлено сообщений.
+	Sent uint64
+	// Dropped — выброшено сообщений: отклонены Telegram, переполнение очереди, отклонённый токен.
+	Dropped uint64
+	// Queued — сообщений в очереди сейчас.
+	Queued int
+	// Connected — связь с Bot API есть (последний запрос без ошибки связи).
+	Connected bool
+}
+
+// Stats возвращает счётчики клиента.
+func (c *Client) Stats() Stats {
+	return Stats{
+		Sent:      c.sent.Load(),
+		Dropped:   c.dropped.Load(),
+		Queued:    c.queue.len(),
+		Connected: !c.failing.Load(),
 	}
 }
 

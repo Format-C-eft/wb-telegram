@@ -18,8 +18,10 @@ var testNow = time.Date(2026, 10, 1, 14, 5, 0, 0, time.UTC)
 // testConfig возвращает конфиг: Супруга (100, уведомления), Ребёнок (200); /gate — всем, /boiler — Супруге.
 func testConfig() *config.Config {
 	return &config.Config{
-		Enabled:       true,
-		ReplyTimeoutS: 10,
+		Enabled:         true,
+		ConnectTimeoutS: 30,
+		PollTimeoutS:    30,
+		ReplyTimeoutS:   10,
 		Users: []config.User{
 			{Name: "Супруга", ChatID: 100, Notifications: true},
 			{Name: "Ребёнок", ChatID: 200},

@@ -191,6 +191,7 @@ func (d *Device) onConnect(_ paho.Client) {
 
 	if d.markReady(generation) {
 		slog.Info("MQTT: устройство опубликовано", "device", d.id)
+		d.options.onConnected(true)
 	}
 }
 
@@ -245,6 +246,7 @@ func (d *Device) onConnectionLost(_ paho.Client, err error) {
 	d.nextGeneration()
 
 	slog.Warn("MQTT: соединение потеряно, переподключаюсь", "err", err)
+	d.options.onConnected(false)
 }
 
 // onReconnecting снимает признак готовности перед каждой попыткой переподключения.

@@ -162,7 +162,7 @@
                         "description": "command_name_description",
                         "pattern": "^[a-z0-9_]{1,32}$",
                         "not": {
-                            "enum": ["start", "help"]
+                            "enum": ["start", "help", "status"]
                         },
                         "options": {
                             "patternmessage": "Only a-z, 0-9 and _, up to 32 characters"

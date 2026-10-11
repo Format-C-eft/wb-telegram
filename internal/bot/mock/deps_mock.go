@@ -134,3 +134,17 @@ func (mr *MockSenderMockRecorder) SetCommands(ctx, chatID, commands any) *gomock
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetCommands", reflect.TypeOf((*MockSender)(nil).SetCommands), ctx, chatID, commands)
 }
+
+// Stats mocks base method.
+func (m *MockSender) Stats() telegram.Stats {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Stats")
+	ret0, _ := ret[0].(telegram.Stats)
+	return ret0
+}
+
+// Stats indicates an expected call of Stats.
+func (mr *MockSenderMockRecorder) Stats() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Stats", reflect.TypeOf((*MockSender)(nil).Stats))
+}
