@@ -22,6 +22,8 @@ const (
 	requestMargin = 10 * time.Second
 	// tcpKeepAlive — период TCP keep-alive: соединение с Bot API переиспользуется между запросами.
 	tcpKeepAlive = 30 * time.Second
+	// maxPingInterval — после стольких секунд тишины на HTTP/2-соединении шлётся ping.
+	maxPingInterval = 15 * time.Second
 )
 
 // Message — входящее текстовое сообщение.
@@ -241,10 +243,21 @@ func (c *Client) undelivered() int {
 // подключения и TLS-рукопожатия connect (у стандартного — 10 с, на медленных каналах
 // рукопожатие с api.telegram.org бывает дольше) и общим таймаутом запроса, который
 // покрывает подключение, long polling и ответ.
+//
+// HTTP/2 гонит все запросы через одно соединение, а таймаут запроса закрывает только
+// запрос. Если соединение умерло «тихо» (перезагрузка роутера: пакеты пропадают, сокет
+// не закрыт), без проверки все запросы уходят в него, пока ядро само не сдастся —
+// минуты и часы. Поэтому включена проверка ping: после тишины шлётся ping, без ответа за
+// connect соединение закрывается, и следующий запрос открывает новое.
 func newHTTPClient(connect, poll time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = (&net.Dialer{Timeout: connect, KeepAlive: tcpKeepAlive}).DialContext
 	transport.TLSHandshakeTimeout = connect
+	transport.HTTP2 = &http.HTTP2Config{
+		SendPingTimeout:  min(connect, maxPingInterval),
+		PingTimeout:      connect,
+		WriteByteTimeout: connect,
+	}
 
 	return &http.Client{
 		Timeout:   connect + poll + requestMargin,
