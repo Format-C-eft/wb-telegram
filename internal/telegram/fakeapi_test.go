@@ -33,6 +33,7 @@ type fakeAPI struct {
 	webhookDeleted bool
 	webhookStatus  string
 	webhookCalls   int
+	pollModes      []string
 }
 
 // newFakeAPI запускает поддельный Bot API.
@@ -172,6 +173,16 @@ func (f *fakeAPI) webhookCallCount() int {
 	return f.webhookCalls
 }
 
+// queuePollModes задаёт поведение следующих вызовов getUpdates: "drop" - оборвать соединение,
+// "429" - Too Many Requests; после очереди getUpdates отвечает как обычно.
+func (f *fakeAPI) queuePollModes(modes ...string) {
+	f.mu.Lock()
+
+	f.pollModes = append(f.pollModes, modes...)
+
+	f.mu.Unlock()
+}
+
 // handleGetUpdates отдаёт накопленные апдейты или пустой список после короткой паузы.
 func (f *fakeAPI) handleGetUpdates(w http.ResponseWriter) {
 	f.mu.Lock()
@@ -179,7 +190,28 @@ func (f *fakeAPI) handleGetUpdates(w http.ResponseWriter) {
 	updates := f.updates
 	f.updates = nil
 
+	mode := ""
+	if len(f.pollModes) > 0 {
+		mode = f.pollModes[0]
+		f.pollModes = f.pollModes[1:]
+	}
+
 	f.mu.Unlock()
+
+	switch mode {
+	case "drop":
+		if hijacker, ok := w.(http.Hijacker); ok {
+			if conn, _, errHijack := hijacker.Hijack(); errHijack == nil {
+				_ = conn.Close()
+			}
+		}
+
+		return
+	case "429":
+		writeError(w, 429, "Too Many Requests", 1)
+
+		return
+	}
 
 	if len(updates) == 0 {
 		time.Sleep(50 * time.Millisecond)

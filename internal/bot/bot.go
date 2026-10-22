@@ -137,6 +137,14 @@ func (b *Bot) Stop() error {
 
 	b.mu.Unlock()
 
+	b.statsMu.Lock()
+
+	if b.stats.telegramStopTimer != nil {
+		b.stats.telegramStopTimer()
+	}
+
+	b.statsMu.Unlock()
+
 	if cancel != nil {
 		cancel()
 		<-b.done
