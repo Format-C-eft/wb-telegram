@@ -54,6 +54,11 @@ type Client struct {
 	failing atomic.Bool
 	fatal   atomic.Bool
 
+	// failMu защищает failSince и failErrors; берётся при смене состояния failing.
+	failMu     sync.Mutex
+	failSince  time.Time
+	failErrors int
+
 	// sent и dropped — счётчики доставленных и выброшенных сообщений для Stats.
 	sent    atomic.Uint64
 	dropped atomic.Uint64
@@ -104,7 +109,7 @@ func New(token string, handler Handler, opts ...Option) (*Client, error) {
 	api, errNew := bot.New(token,
 		bot.WithSkipGetMe(),
 		bot.WithServerURL(o.serverURL),
-		bot.WithHTTPClient(o.pollTimeout, newHTTPClient(o.connectTimeout, o.pollTimeout)),
+		bot.WithHTTPClient(o.pollTimeout, &healthClient{inner: newHTTPClient(o.connectTimeout, o.pollTimeout), alive: c.markHealthy}),
 		bot.WithAllowedUpdates(bot.AllowedUpdates{"message"}),
 		bot.WithDefaultHandler(c.dispatch(handler)),
 		bot.WithErrorsHandler(c.onPollError),
@@ -296,13 +301,18 @@ func (c *Client) dispatch(handler Handler) bot.HandlerFunc {
 }
 
 // onPollError обрабатывает ошибки polling: 401 — фатально, отмена и потеря апдейтов при
-// остановке игнорируются, ошибки разбора пишутся коротко (без текста сообщения), остальное — сбой связи.
+// остановке игнорируются, 429 — не сбой связи, ошибки разбора пишутся коротко (без текста сообщения),
+// остальное — сбой связи.
 func (c *Client) onPollError(err error) {
 	text := err.Error()
+
+	var tooMany *bot.TooManyRequestsError
 
 	switch {
 	case errors.Is(err, bot.ErrorUnauthorized):
 		c.reportFatal(translate("poll", err, c.mask))
+	case errors.As(err, &tooMany):
+		slog.Info("Telegram: слишком частые запросы, жду", "retry_after", time.Duration(tooMany.RetryAfter)*time.Second)
 	case errors.Is(err, context.Canceled), strings.HasPrefix(text, "some updates lost"):
 		return
 	case strings.HasPrefix(text, "error decode update"):
@@ -352,7 +362,9 @@ func (c *Client) fail(op string, err error) *Error {
 	switch translated.kind {
 	case kindUnauthorized:
 		c.reportFatal(translated)
-	case kindTransient, kindRateLimited:
+	case kindRateLimited:
+		slog.Info("Telegram: слишком частые запросы, жду", "op", op, "retry_after", translated.RetryAfter)
+	case kindTransient:
 		c.markFailing(translated.Error())
 	}
 
@@ -368,7 +380,18 @@ func (c *Client) reportFatal(err *Error) {
 
 // markFailing пишет в журнал только первую ошибку связи подряд.
 func (c *Client) markFailing(message string) {
-	if c.failing.CompareAndSwap(false, true) {
+	c.failMu.Lock()
+
+	c.failErrors++
+
+	first := c.failing.CompareAndSwap(false, true)
+	if first {
+		c.failSince = time.Now()
+	}
+
+	c.failMu.Unlock()
+
+	if first {
 		slog.Warn("Telegram: ошибка связи, повторяю в фоне", "err", message)
 		c.options.onConnection(false, message)
 
@@ -378,12 +401,27 @@ func (c *Client) markFailing(message string) {
 	slog.Debug("Telegram: ошибка связи продолжается", "err", message)
 }
 
-// markHealthy пишет в журнал восстановление связи после серии ошибок.
+// markHealthy пишет в журнал восстановление связи после серии ошибок: сколько длилась и сколько ошибок подряд.
 func (c *Client) markHealthy() {
-	if c.failing.CompareAndSwap(true, false) {
-		slog.Info("Telegram: связь восстановлена")
-		c.options.onConnection(true, "")
+	if !c.failing.Load() {
+		return
 	}
+
+	c.failMu.Lock()
+
+	recovered := c.failing.CompareAndSwap(true, false)
+	since := c.failSince
+	errorsInRow := c.failErrors
+	c.failErrors = 0
+
+	c.failMu.Unlock()
+
+	if !recovered {
+		return
+	}
+
+	slog.Info("Telegram: связь восстановлена", "после", time.Since(since).Round(time.Millisecond), "ошибок", errorsInRow)
+	c.options.onConnection(true, "")
 }
 
 // Stats — счётчики клиента с момента запуска.

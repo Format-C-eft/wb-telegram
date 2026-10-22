@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // connectionLog запоминает события WithOnConnection.
@@ -65,5 +66,65 @@ func TestOnConnectionAndStats(t *testing.T) {
 
 	if !client.Stats().Connected {
 		t.Fatal("Stats().Connected = false after recovery")
+	}
+}
+
+// TestRecoveryWithoutActivity проверяет, что после обрыва опроса связь считается восстановленной
+// по пустому успешному ответу, без апдейтов и отправок.
+func TestRecoveryWithoutActivity(t *testing.T) {
+	t.Parallel()
+
+	api := newFakeAPI(t)
+	api.queuePollModes("drop")
+	api.setWebhookStatus("400")
+
+	log := &connectionLog{}
+	client := startClient(t, api, func(context.Context, Message) {}, WithOnConnection(log.add), withSleep(noSleep))
+
+	waitFor(t, "down and up events", func() bool {
+		events := log.snapshot()
+
+		return len(events) >= 2 && events[len(events)-1] == "up"
+	})
+
+	events := log.snapshot()
+	if !strings.HasPrefix(events[0], "down:") {
+		t.Fatalf("events = %q, want down first", events)
+	}
+
+	if !client.Stats().Connected {
+		t.Fatal("Stats().Connected = false after empty successful poll")
+	}
+
+	if client.Stats().Sent != 0 || len(api.sentMessages()) != 0 {
+		t.Fatal("recovery must not depend on sending")
+	}
+}
+
+// TestRateLimitedPollIsNotOutage проверяет, что 429 на getUpdates не считается сбоем связи.
+func TestRateLimitedPollIsNotOutage(t *testing.T) {
+	t.Parallel()
+
+	api := newFakeAPI(t)
+	api.queuePollModes("429", "429")
+
+	log := &connectionLog{}
+	client := startClient(t, api, func(context.Context, Message) {}, WithOnConnection(log.add), withSleep(noSleep))
+
+	waitFor(t, "poll modes consumed", func() bool {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+
+		return len(api.pollModes) == 0
+	})
+
+	time.Sleep(1500 * time.Millisecond)
+
+	if events := log.snapshot(); len(events) != 0 {
+		t.Fatalf("events = %q, want none", events)
+	}
+
+	if !client.Stats().Connected {
+		t.Fatal("Stats().Connected = false after 429")
 	}
 }

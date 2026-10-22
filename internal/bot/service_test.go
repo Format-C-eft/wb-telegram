@@ -41,16 +41,47 @@ func TestReportTelegram(t *testing.T) {
 	clock := &movableClock{now: testNow}
 	b, deps := newTestBot(t, withClock(clock.get))
 
-	deps.sender.EXPECT().Send(int64(100),
-		"✅ Связь с Telegram восстановлена. Не было 1 мин 17 с (с 14:05:00), причина: соединение оборвалось").Return(nil)
+	gomock.InOrder(
+		deps.sender.EXPECT().Send(int64(100),
+			"⚠️ Нет связи с Telegram уже 30 с (с 14:05:00), причина: соединение оборвалось").Return(nil),
+		deps.sender.EXPECT().Send(int64(100),
+			"✅ Связь с Telegram восстановлена. Не было 1 мин 17 с (с 14:05:00), причина: соединение оборвалось").Return(nil),
+	)
 
 	b.ReportTelegram(true, "")
 	b.ReportTelegram(false, "error get updates: Post \"https://api.telegram.org/bot***/getUpdates\": http2: client connection lost")
 	clock.advance(10 * time.Second)
 	b.ReportTelegram(false, "context deadline exceeded")
-	clock.advance(67 * time.Second)
+	clock.advance(outageNoticeDelay)
+	deps.timers.fire(0)
+	clock.advance(37 * time.Second)
 	b.ReportTelegram(true, "")
 	b.ReportTelegram(true, "")
+}
+
+// TestReportTelegramShortOutage проверяет, что обрыв короче порога не порождает сообщений, а только считается.
+func TestReportTelegramShortOutage(t *testing.T) {
+	t.Parallel()
+
+	clock := &movableClock{now: testNow}
+	b, deps := newTestBot(t, withClock(clock.get))
+
+	b.ReportTelegram(false, "unexpected EOF")
+	clock.advance(5 * time.Second)
+	b.ReportTelegram(true, "")
+
+	deps.timers.fire(0)
+
+	b.statsMu.Lock()
+	defer b.statsMu.Unlock()
+
+	if b.stats.telegramShort != 1 || len(b.stats.telegramOutages) != 0 {
+		t.Fatalf("short = %d, long = %d, want 1 and 0", b.stats.telegramShort, len(b.stats.telegramOutages))
+	}
+
+	if got := deps.timers.duration(0); got != outageNoticeDelay {
+		t.Fatalf("timer delay = %v, want %v", got, outageNoticeDelay)
+	}
 }
 
 // TestReportMQTT проверяет сообщения о потере и восстановлении связи с брокером без повторов.
@@ -130,6 +161,10 @@ func TestStatusText(t *testing.T) {
 
 	b.ReportTelegram(false, "net/http: TLS handshake timeout")
 	clock.advance(77 * time.Second)
+	deps.timers.fire(deps.timers.count() - 1)
+	b.ReportTelegram(true, "")
+	b.ReportTelegram(false, "unexpected EOF")
+	clock.advance(3 * time.Second)
 	b.ReportTelegram(true, "")
 	b.ReportMQTT(false)
 	clock.advance(time.Second)
@@ -142,6 +177,7 @@ func TestStatusText(t *testing.T) {
 		"Работает 2 ч 1 мин (с 14:05)",
 		"Telegram: ✅ связь есть",
 		"  обрывов за сутки: 1, последний 16:05, длился 1 мин 17 с",
+		"  Кратких обрывов с запуска: 1",
 		"MQTT: ✅ подключено",
 		"  переподключений: 1, последнее 16:06",
 		"Сообщения: отправлено 42, не доставлено 1, в очереди 2",

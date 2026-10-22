@@ -17,6 +17,10 @@ const statusDescription = "Состояние бота"
 // outageWindow — окно подсчёта обрывов связи с Telegram в /status.
 const outageWindow = 24 * time.Hour
 
+// outageNoticeDelay — сколько связь с Telegram должна отсутствовать, чтобы это стало «долгим сбоем»
+// со служебным сообщением; обрывы короче только считаются.
+const outageNoticeDelay = 30 * time.Second
+
 // lastCallInfo — последний опубликованный вызов команды.
 type lastCallInfo struct {
 	id      string
@@ -33,6 +37,9 @@ type serviceStats struct {
 
 	telegramDownSince time.Time
 	telegramReason    string
+	telegramLongDown  bool
+	telegramStopTimer func() bool
+	telegramShort     int
 	telegramOutages   []time.Time
 	telegramLastStart time.Time
 	telegramLastFor   time.Duration
@@ -47,9 +54,9 @@ type serviceStats struct {
 	lastCall   *lastCallInfo
 }
 
-// ReportTelegram отражает смену состояния связи с Bot API; после восстановления присылает
-// получателям системных уведомлений, сколько не было связи и почему. Сообщение о потере
-// не отправляется: Telegram в этот момент недоступен.
+// ReportTelegram отражает смену состояния связи с Bot API. Если связи нет дольше outageNoticeDelay,
+// получатели системных уведомлений узнают о потере, а после восстановления - сколько её не было;
+// более короткие обрывы только считаются.
 func (b *Bot) ReportTelegram(ok bool, reason string) {
 	now := b.options.now()
 
@@ -59,6 +66,7 @@ func (b *Bot) ReportTelegram(ok bool, reason string) {
 		if b.stats.telegramDownSince.IsZero() {
 			b.stats.telegramDownSince = now
 			b.stats.telegramReason = reason
+			b.stats.telegramStopTimer = b.options.afterFunc(outageNoticeDelay, b.announceTelegramLoss(now))
 		}
 
 		b.statsMu.Unlock()
@@ -68,22 +76,56 @@ func (b *Bot) ReportTelegram(ok bool, reason string) {
 
 	since := b.stats.telegramDownSince
 	cause := b.stats.telegramReason
+	announced := b.stats.telegramLongDown
 
 	if !since.IsZero() {
+		if b.stats.telegramStopTimer != nil {
+			b.stats.telegramStopTimer()
+		}
+
 		b.stats.telegramDownSince = time.Time{}
-		b.stats.telegramOutages = append(pruneOutages(b.stats.telegramOutages, now), since)
-		b.stats.telegramLastStart = since
-		b.stats.telegramLastFor = now.Sub(since)
+		b.stats.telegramLongDown = false
+		b.stats.telegramStopTimer = nil
+
+		if !announced {
+			b.stats.telegramShort++
+		} else {
+			b.stats.telegramOutages = append(pruneOutages(b.stats.telegramOutages, now), since)
+			b.stats.telegramLastStart = since
+			b.stats.telegramLastFor = now.Sub(since)
+		}
 	}
 
 	b.statsMu.Unlock()
 
-	if since.IsZero() {
+	if !announced {
 		return
 	}
 
 	b.notifyService(fmt.Sprintf("✅ Связь с Telegram восстановлена. Не было %s (с %s), причина: %s",
 		formatDuration(now.Sub(since)), b.clock(since), describeReason(cause)))
+}
+
+// announceTelegramLoss возвращает обработчик таймера: если обрыв, начатый в since, всё ещё идёт,
+// отправляет служебное сообщение о потере связи.
+func (b *Bot) announceTelegramLoss(since time.Time) func() {
+	return func() {
+		b.statsMu.Lock()
+
+		if b.stats.telegramDownSince.IsZero() || !b.stats.telegramDownSince.Equal(since) {
+			b.statsMu.Unlock()
+
+			return
+		}
+
+		b.stats.telegramLongDown = true
+		cause := b.stats.telegramReason
+
+		b.statsMu.Unlock()
+
+		b.notifyService(fmt.Sprintf("⚠️ Нет связи с Telegram уже %s (с %s), причина: %s",
+			formatDuration(outageNoticeDelay), b.clock(since), describeReason(cause)))
+	}
 }
 
 // ReportMQTT отражает связь с MQTT-брокером контроллера: сообщает о потере сразу (Telegram при
@@ -213,7 +255,7 @@ func (b *Bot) outagesLine(stats serviceStats) string {
 		line += fmt.Sprintf(", последний %s, длился %s", b.dateTime(stats.telegramLastStart), formatDuration(stats.telegramLastFor))
 	}
 
-	return line
+	return line + fmt.Sprintf("\n  Кратких обрывов с запуска: %d", stats.telegramShort)
 }
 
 // reconnectsLine описывает переподключения к MQTT.
