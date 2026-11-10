@@ -54,10 +54,13 @@ type serviceStats struct {
 	lastCall   *lastCallInfo
 }
 
-// ReportTelegram отражает смену состояния связи с Bot API. Если связи нет дольше outageNoticeDelay,
-// получатели системных уведомлений узнают о потере, а после восстановления - сколько её не было;
-// более короткие обрывы только считаются.
+// ReportTelegram учитывает состояние связи и уведомляет о длительных сбоях.
 func (b *Bot) ReportTelegram(ok bool, reason string) {
+	if !b.beginOperation() {
+		return
+	}
+	defer b.operations.Done()
+
 	now := b.options.now()
 
 	b.statsMu.Lock()
@@ -106,8 +109,7 @@ func (b *Bot) ReportTelegram(ok bool, reason string) {
 		formatDuration(now.Sub(since)), b.clock(since), describeReason(cause)))
 }
 
-// announceTelegramLoss возвращает обработчик таймера: если обрыв, начатый в since, всё ещё идёт,
-// отправляет служебное сообщение о потере связи.
+// announceTelegramLoss создаёт обработчик уведомления о длительном обрыве.
 func (b *Bot) announceTelegramLoss(since time.Time) func() {
 	return func() {
 		b.statsMu.Lock()
@@ -128,9 +130,13 @@ func (b *Bot) announceTelegramLoss(since time.Time) func() {
 	}
 }
 
-// ReportMQTT отражает связь с MQTT-брокером контроллера: сообщает о потере сразу (Telegram при
-// этом работает) и о восстановлении — с длительностью.
+// ReportMQTT учитывает состояние MQTT и уведомляет о смене связи.
 func (b *Bot) ReportMQTT(ok bool) {
+	if !b.beginOperation() {
+		return
+	}
+	defer b.operations.Done()
+
 	now := b.options.now()
 
 	b.statsMu.Lock()
@@ -159,9 +165,11 @@ func (b *Bot) ReportMQTT(ok bool) {
 
 // notifyService отправляет служебное сообщение получателям системных уведомлений.
 func (b *Bot) notifyService(text string) {
-	if b.isStopped() {
+	if !b.beginOperation() {
 		return
 	}
+
+	defer b.operations.Done()
 
 	for _, user := range b.cfg.NotificationUsers() {
 		b.deliver(user.ChatID, text)

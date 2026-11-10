@@ -3,50 +3,86 @@ package bot
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"slices"
 	"strings"
+	"unicode/utf16"
+
+	"github.com/Format-C-eft/wb-telegram/internal/chart"
+	"github.com/Format-C-eft/wb-telegram/internal/telegram"
 
 	"github.com/Format-C-eft/wb-telegram/internal/wbdevice"
 )
 
-// sendRequest — сообщение от правил в контрол send; поле id ботом игнорируется.
+// sendRequest описывает сообщение или запрос графика от правил.
 type sendRequest struct {
-	Text    string   `json:"text"`
-	To      []string `json:"to"`
-	ReplyTo string   `json:"reply_to"`
+	ID        json.RawMessage    `json:"id"`
+	Text      string             `json:"text"`
+	To        []string           `json:"to"`
+	ReplyTo   string             `json:"reply_to"`
+	ParseMode telegram.ParseMode `json:"parse_mode"`
+	Buttons   [][]buttonSpec     `json:"buttons"`
+	Chart     *chart.Spec        `json:"chart"`
 }
 
-// HandleSend доставляет сообщение правил получателям и публикует его в контрол send.
+// HandleSend принимает сообщение правил без ожидания построения графика.
 func (b *Bot) HandleSend(payload []byte) {
-	if b.isStopped() {
-		slog.Debug("ядро остановлено, сообщение правил не отправлено")
+	if !b.beginOperation() {
+		return
+	}
+	defer b.operations.Done()
+
+	req, errParse := parseSendRequest(fixCESU8(payload))
+	if errParse != nil {
+		slog.Warn("send: сообщение правил отклонено", "err", errParse)
 
 		return
 	}
 
-	req, errParse := parseSendRequest(fixCESU8(payload))
-	if errParse != nil {
-		slog.Warn("send: сообщение от правил проигнорировано", "err", errParse, "payload", string(payload))
+	if req.Chart != nil {
+		b.handleChart(req)
 
 		return
 	}
 
 	for _, chatID := range b.recipients(req) {
-		b.deliver(chatID, req.Text)
+		if req.ParseMode == telegram.ParseModePlain && req.Buttons == nil {
+			b.deliver(chatID, req.Text)
+		} else {
+			b.sendInteraction(chatID, req)
+		}
 	}
 
-	errValue := b.publisher.SetValue(SendControl, req.Text)
+	b.publishSummary(req.Text)
+}
+
+// publishSummary сохраняет текст последнего сообщения в контроле send.
+func (b *Bot) publishSummary(text string) {
+	errValue := b.publisher.SetValue(SendControl, text)
 	if errValue != nil {
-		slog.Warn("MQTT: не удалось обновить контрол send", "err", errValue)
+		slog.Warn("MQTT: текст сообщения не опубликован", "err", errValue)
 	}
 }
 
-// ReportDelivery отражает результат доставки во флаге ошибки контрола send: "w" после неудачной
-// попытки, "" после первой успешной; публикует только при смене состояния. Вызывается из любых
-// горутин клиента Telegram. Публикация идёт под deliveryMu, поэтому флаги в MQTT меняются в том же
-// порядке, что и состояние; SetError устройства не вызывает ядро обратно, взаимоблокировки нет.
+// reportInteractionError записывает локальный отказ без повторной отправки через закрытый клиент.
+func (b *Bot) reportInteractionError(chatID int64, err error) {
+	slog.Warn("Telegram: сообщение не принято", "chat_id", chatID, "err", err)
+
+	if errors.Is(err, telegram.ErrClosed) {
+		return
+	}
+
+	b.deliver(chatID, "Не удалось подготовить сообщение, повторите команду")
+}
+
+// ReportDelivery отражает результат отправки во флаге контрола send.
 func (b *Bot) ReportDelivery(err error) {
+	if !b.beginOperation() {
+		return
+	}
+	defer b.operations.Done()
+
 	failing := err != nil
 
 	b.deliveryMu.Lock()
@@ -69,27 +105,69 @@ func (b *Bot) ReportDelivery(err error) {
 	}
 }
 
-// parseSendRequest разбирает строку или JSON-объект; пустой текст — ошибка.
+// badPayload создаёт безопасную ошибку входного сообщения.
+func badPayload(message string) error {
+	return &Error{kind: kindBadPayload, Op: "parse send", Message: message}
+}
+
+// parseSendRequest разбирает и проверяет сообщение правил.
 func parseSendRequest(payload []byte) (sendRequest, error) {
 	trimmed := bytes.TrimSpace(payload)
 
 	var req sendRequest
-
 	if bytes.HasPrefix(trimmed, []byte("{")) {
 		errUnmarshal := json.Unmarshal(trimmed, &req)
 		if errUnmarshal != nil {
-			return sendRequest{}, &Error{kind: kindBadPayload, Op: "parse send", Message: errUnmarshal.Error()}
+			return sendRequest{}, badPayload("invalid JSON fields")
 		}
 	} else {
 		req.Text = string(trimmed)
 	}
 
-	req.Text = strings.TrimSpace(req.Text)
-	if req.Text == "" {
-		return sendRequest{}, &Error{kind: kindBadPayload, Op: "parse send", Message: "empty text"}
+	errValidate := req.validate()
+	if errValidate != nil {
+		return sendRequest{}, errValidate
+	}
+
+	if req.ParseMode == telegram.ParseModePlain {
+		req.Text = strings.TrimSpace(req.Text)
 	}
 
 	return req, nil
+}
+
+// validate проверяет сочетания полей сообщения.
+func (req sendRequest) validate() error {
+	if req.Chart != nil {
+		if req.Text != "" || req.ParseMode != "" || req.Buttons != nil {
+			return badPayload("chart cannot contain text, formatting or buttons")
+		}
+
+		errSpec := req.Chart.Validate()
+		if errSpec != nil {
+			return badPayload("invalid chart specification")
+		}
+
+		return nil
+	}
+
+	if strings.TrimSpace(req.Text) == "" {
+		return badPayload("empty text")
+	}
+
+	if req.ParseMode != telegram.ParseModePlain && req.ParseMode != telegram.ParseModeHTML && req.ParseMode != telegram.ParseModeMarkdownV2 {
+		return badPayload("unsupported parse mode")
+	}
+
+	if req.ParseMode != telegram.ParseModePlain && len(utf16.Encode([]rune(req.Text))) > 4096 {
+		return badPayload("formatted text is too long")
+	}
+
+	if req.Buttons != nil {
+		return validateButtons(req.Buttons)
+	}
+
+	return nil
 }
 
 // recipients выбирает chat_id получателей: автор вызова, названные люди или подписчики уведомлений.
@@ -124,8 +202,7 @@ func (b *Bot) recipients(req sendRequest) []int64 {
 	return chats
 }
 
-// replyRecipient находит автора вызова и снимает ожидание ответа; вызов остаётся в памяти,
-// чтобы повторные и поздние ответы тоже дошли до автора.
+// replyRecipient находит автора вызова и отмечает получение ответа.
 func (b *Bot) replyRecipient(id string) []int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -38,6 +38,10 @@ clean:
 .PHONY: test
 test:
 	$(GO) test -race ./... -count=1 -timeout=60s -v -short
+
+.PHONY: test-js
+test-js:
+	node --test wb/rules-modules/telegram.test.js
 ###### ТЕСТЫ ######
 
 ###### ЛИНТ ######

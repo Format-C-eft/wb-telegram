@@ -12,20 +12,23 @@ type Option func(*options)
 
 // options — настройки Bot.
 type options struct {
-	now        func() time.Time
-	afterFunc  func(d time.Duration, f func()) func() bool
-	sleep      func(ctx context.Context, d time.Duration) bool
-	location   *time.Location
-	pendingTTL time.Duration
-	retryBase  time.Duration
-	retryMax   time.Duration
-	version    string
+	now          func() time.Time
+	afterFunc    func(d time.Duration, f func()) func() bool
+	sleep        func(ctx context.Context, d time.Duration) bool
+	location     *time.Location
+	pendingTTL   time.Duration
+	retryBase    time.Duration
+	retryMax     time.Duration
+	version      string
+	buttonToken  func() (string, error)
+	chartBuilder ChartBuilder
 }
 
 // defaultOptions возвращает настройки по умолчанию.
 func defaultOptions() options {
 	return options{
-		now: time.Now,
+		now:         time.Now,
+		buttonToken: makeButtonToken,
 		afterFunc: func(d time.Duration, f func()) func() bool {
 			return time.AfterFunc(d, f).Stop
 		},
@@ -40,7 +43,7 @@ func defaultOptions() options {
 
 // Validate проверяет настройки.
 func (o options) Validate() error {
-	if o.now == nil || o.afterFunc == nil || o.sleep == nil || o.location == nil {
+	if o.now == nil || o.afterFunc == nil || o.sleep == nil || o.location == nil || o.buttonToken == nil {
 		return &Error{kind: kindInvalidArgument, Op: "validate", Message: "clock, timers, sleep and location are required"}
 	}
 
@@ -74,4 +77,9 @@ func withSleep(f func(ctx context.Context, d time.Duration) bool) Option {
 // withLocation задаёт часовой пояс для времени в сообщениях (для тестов).
 func withLocation(location *time.Location) Option {
 	return func(o *options) { o.location = location }
+}
+
+// WithChartBuilder подключает построение графиков истории.
+func WithChartBuilder(builder ChartBuilder) Option {
+	return func(o *options) { o.chartBuilder = builder }
 }

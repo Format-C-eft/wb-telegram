@@ -10,8 +10,9 @@ import (
 // Option настраивает Client.
 type Option func(*options)
 
-// options — настройки Client.
+// options - настройки Client.
 type options struct {
+	onCallback      CallbackHandler
 	serverURL       string
 	connectTimeout  time.Duration
 	pollTimeout     time.Duration
@@ -64,7 +65,7 @@ func (o options) Validate() error {
 	return nil
 }
 
-// WithServerURL задаёт адрес Bot API (для тестов — httptest.Server).
+// WithServerURL задаёт адрес Bot API (для тестов - httptest.Server).
 func WithServerURL(url string) Option {
 	return func(o *options) { o.serverURL = url }
 }
@@ -77,10 +78,7 @@ func WithTimeouts(connect, poll time.Duration) Option {
 	}
 }
 
-// WithOnConnection задаёт реакцию на смену состояния связи с Bot API: ok=false с причиной
-// (замаскированный текст ошибки) при первой ошибке подряд, ok=true при восстановлении.
-// Вызывается на внутренних горутинах клиента: обработчик должен быть потокобезопасным,
-// не блокироваться и не вызывать Shutdown/Stop синхронно.
+// WithOnConnection задаёт потокобезопасный обработчик изменения состояния связи.
 func WithOnConnection(f func(ok bool, reason string)) Option {
 	return func(o *options) { o.onConnection = f }
 }
@@ -99,7 +97,6 @@ func WithRateLimits(perChat, global time.Duration) Option {
 }
 
 // WithRetry задаёт паузы повторов при временных ошибках: экспонента от base до maxDelay.
-// Повторы не ограничены по числу — сообщение повторяется до успеха или остановки клиента.
 func WithRetry(base, maxDelay time.Duration) Option {
 	return func(o *options) {
 		o.retryBase = base
@@ -107,17 +104,12 @@ func WithRetry(base, maxDelay time.Duration) Option {
 	}
 }
 
-// WithOnFatal задаёт реакцию на неустранимую ошибку (отклонённый токен). Вызывается не более
-// одного раза, на внутренней горутине клиента (polling, отправка, deleteWebhook): f должна быть
-// потокобезопасной, не блокироваться и не вызывать Shutdown/Stop синхронно — иначе взаимоблокировка.
+// WithOnFatal задаёт потокобезопасный обработчик отклонения токена.
 func WithOnFatal(f func(error)) Option {
 	return func(o *options) { o.onFatal = f }
 }
 
-// WithOnDelivery задаёт реакцию на результат доставки: nil — успех, ошибка — после каждой неудачной
-// попытки, ErrQueueFull — при выбросе сообщения из переполненной очереди. Вызывается и из горутины,
-// вызвавшей Send, и из цикла отправки: f должна быть потокобезопасной, не блокироваться и не
-// вызывать Shutdown/Stop синхронно.
+// WithOnDelivery задаёт потокобезопасный обработчик результатов доставки.
 func WithOnDelivery(f func(error)) Option {
 	return func(o *options) { o.onDelivery = f }
 }
@@ -125,4 +117,9 @@ func WithOnDelivery(f func(error)) Option {
 // withSleep подменяет ожидание (для тестов).
 func withSleep(f func(ctx context.Context, d time.Duration) bool) Option {
 	return func(o *options) { o.sleep = f }
+}
+
+// WithCallbackHandler задаёт обработчик нажатий кнопок.
+func WithCallbackHandler(handler CallbackHandler) Option {
+	return func(o *options) { o.onCallback = handler }
 }

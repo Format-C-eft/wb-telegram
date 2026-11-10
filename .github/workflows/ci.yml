@@ -31,8 +31,15 @@ jobs:
         with:
           go-version: "1.26"
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
       - name: Тесты
         run: make test
+
+      - name: Тесты JS API
+        run: make test-js
 
       - name: Lint изменений
         run: make lint
@@ -50,10 +57,19 @@ jobs:
         with:
           go-version: "1.26"
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
       - name: Тесты
         id: test
         continue-on-error: true
         run: make test
+
+      - name: Тесты JS API
+        id: test-js
+        continue-on-error: true
+        run: make test-js
 
       - name: Полный lint
         id: lint
@@ -64,16 +80,18 @@ jobs:
         if: always()
         env:
           TEST: ${{ steps.test.outcome }}
+          TEST_JS: ${{ steps.test-js.outcome }}
           LINT: ${{ steps.lint.outcome }}
         run: |
           {
             echo "### Состояние master"
             echo "- Тесты: ${TEST}"
+            echo "- Тесты JS API: ${TEST_JS}"
             echo "- Полный lint: ${LINT}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$TEST" != "success" ] || [ "$LINT" != "success" ]; then
-            echo "::warning::master: тесты — ${TEST}, полный lint — ${LINT}. Поправить в следующих релизах."
+          if [ "$TEST" != "success" ] || [ "$TEST_JS" != "success" ] || [ "$LINT" != "success" ]; then
+            echo "::warning::master: тесты - ${TEST}, тесты JS API - ${TEST_JS}, полный lint - ${LINT}. Поправить в следующих релизах."
           fi
 
   version:
