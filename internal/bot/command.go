@@ -26,9 +26,11 @@ type commandEvent struct {
 
 // HandleMessage обрабатывает входящее сообщение Telegram.
 func (b *Bot) HandleMessage(_ context.Context, msg telegram.Message) {
-	if b.isStopped() {
+	if !b.beginOperation() {
 		return
 	}
+
+	defer b.operations.Done()
 
 	user, ok := b.cfg.UserByChatID(msg.ChatID)
 	if !ok {
@@ -159,15 +161,21 @@ func (b *Bot) untrack(id string) {
 
 // onReplyTimeout сообщает автору, что правило не ответило вовремя.
 func (b *Bot) onReplyTimeout(id string) {
+	if !b.beginOperation() {
+		return
+	}
+	defer b.operations.Done()
+
 	b.mu.Lock()
 
 	call, ok := b.pending[id]
-	if !ok || call.answered || b.stopped {
+	if !ok || call.answered || call.timeoutNotified || b.stopped {
 		b.mu.Unlock()
 
 		return
 	}
 
+	call.timeoutNotified = true
 	chatID := call.chatID
 	command := call.command
 

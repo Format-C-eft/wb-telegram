@@ -1,3 +1,4 @@
+// Package telegram предоставляет транспорт Telegram Bot API.
 package telegram
 
 import (
@@ -18,15 +19,15 @@ import (
 )
 
 const (
-	// requestMargin — запас таймаута HTTP-запроса сверх подключения и long polling.
+	// requestMargin - запас таймаута HTTP-запроса сверх подключения и long polling.
 	requestMargin = 10 * time.Second
-	// tcpKeepAlive — период TCP keep-alive: соединение с Bot API переиспользуется между запросами.
+	// tcpKeepAlive - период TCP keep-alive: соединение с Bot API переиспользуется между запросами.
 	tcpKeepAlive = 30 * time.Second
-	// maxPingInterval — после стольких секунд тишины на HTTP/2-соединении шлётся ping.
+	// maxPingInterval - после стольких секунд тишины на HTTP/2-соединении шлётся ping.
 	maxPingInterval = 15 * time.Second
 )
 
-// Message — входящее текстовое сообщение.
+// Message - входящее текстовое сообщение.
 type Message struct {
 	UpdateID int64
 	ChatID   int64
@@ -34,7 +35,7 @@ type Message struct {
 	Date     time.Time
 }
 
-// Command — пункт меню команд Telegram.
+// Command - пункт меню команд Telegram.
 type Command struct {
 	Name        string
 	Description string
@@ -43,7 +44,7 @@ type Command struct {
 // Handler обрабатывает входящее сообщение.
 type Handler func(ctx context.Context, msg Message)
 
-// Client — Telegram-клиент: long polling, меню команд, очередь отправки с лимитами.
+// Client - Telegram-клиент: long polling, меню команд, очередь отправки с лимитами.
 type Client struct {
 	api     *bot.Bot
 	token   string
@@ -59,13 +60,13 @@ type Client struct {
 	failSince  time.Time
 	failErrors int
 
-	// sent и dropped — счётчики доставленных и выброшенных сообщений для Stats.
+	// sent и dropped - счётчики доставленных и выброшенных сообщений для Stats.
 	sent    atomic.Uint64
 	dropped atomic.Uint64
 
-	// fatalReported — onDelivery(ErrUnauthorized) уже отправлен; только для цикла отправки.
+	// fatalReported - onDelivery(ErrUnauthorized) уже отправлен; только для цикла отправки.
 	fatalReported bool
-	// lostInFlight — цикл отправки остановлен посреди доставки сообщения; пишется только циклом
+	// lostInFlight - цикл отправки остановлен посреди доставки сообщения; пишется только циклом
 	// отправки до закрытия sendDone, читается после него.
 	lostInFlight bool
 
@@ -77,6 +78,7 @@ type Client struct {
 	pollDone    chan struct{}
 	sendDone    chan struct{}
 	webhookDone chan struct{}
+	control     chan struct{}
 }
 
 // New создаёт клиента; сетевых вызовов не делает.
@@ -98,6 +100,7 @@ func New(token string, handler Handler, opts ...Option) (*Client, error) {
 
 	c := &Client{
 		token:       token,
+		control:     make(chan struct{}, 4),
 		options:     o,
 		queue:       newQueue(o.queueSize),
 		limiter:     newLimiter(o.perChatInterval, o.globalInterval, time.Now),
@@ -110,7 +113,7 @@ func New(token string, handler Handler, opts ...Option) (*Client, error) {
 		bot.WithSkipGetMe(),
 		bot.WithServerURL(o.serverURL),
 		bot.WithHTTPClient(o.pollTimeout, &healthClient{inner: newHTTPClient(o.connectTimeout, o.pollTimeout), alive: c.markHealthy}),
-		bot.WithAllowedUpdates(bot.AllowedUpdates{"message"}),
+		bot.WithAllowedUpdates(bot.AllowedUpdates{"message", "callback_query"}),
 		bot.WithDefaultHandler(c.dispatch(handler)),
 		bot.WithErrorsHandler(c.onPollError),
 	)
@@ -190,8 +193,7 @@ func (c *Client) SetCommands(ctx context.Context, chatID int64, commands []Comma
 	return nil
 }
 
-// Shutdown останавливает polling и досылает очередь, пока не истечёт ctx; что не успело уйти,
-// выбрасывается с одним предупреждением в журнале (без текстов), ошибкой это не считается.
+// Shutdown останавливает polling и досылает очередь до истечения контекста.
 func (c *Client) Shutdown(ctx context.Context) error {
 	c.mu.Lock()
 
@@ -211,6 +213,8 @@ func (c *Client) Shutdown(ctx context.Context) error {
 	c.queue.close()
 
 	if !started {
+		c.queue.release()
+
 		return nil
 	}
 
@@ -228,16 +232,17 @@ func (c *Client) Shutdown(ctx context.Context) error {
 	<-c.pollDone
 	<-c.webhookDone
 
-	// Истёкшая досылка — штатная остановка, а не ошибка: остаток очереди выбрасывается.
+	// Истёкшая досылка - штатная остановка, а не ошибка: остаток очереди выбрасывается.
 	if lost := c.undelivered(); lost > 0 {
 		slog.Warn("Telegram: остановка, недоставленные сообщения выброшены", "count", lost)
 	}
 
+	c.queue.release()
+
 	return nil
 }
 
-// undelivered возвращает число сообщений, не доставленных к остановке цикла отправки:
-// оставшиеся в очереди и прерванное посреди доставки. Вызывать после закрытия sendDone.
+// undelivered возвращает число недоставленных сообщений после остановки отправки.
 func (c *Client) undelivered() int {
 	lost := c.queue.len()
 
@@ -248,16 +253,7 @@ func (c *Client) undelivered() int {
 	return lost
 }
 
-// newHTTPClient собирает HTTP-клиент для Bot API: стандартный транспорт с таймаутами
-// подключения и TLS-рукопожатия connect (у стандартного — 10 с, на медленных каналах
-// рукопожатие с api.telegram.org бывает дольше) и общим таймаутом запроса, который
-// покрывает подключение, long polling и ответ.
-//
-// HTTP/2 гонит все запросы через одно соединение, а таймаут запроса закрывает только
-// запрос. Если соединение умерло «тихо» (перезагрузка роутера: пакеты пропадают, сокет
-// не закрыт), без проверки все запросы уходят в него, пока ядро само не сдастся —
-// минуты и часы. Поэтому включена проверка ping: после тишины шлётся ping, без ответа за
-// connect соединение закрывается, и следующий запрос открывает новое.
+// newHTTPClient создаёт HTTP-клиент с таймаутами и проверкой соединения.
 func newHTTPClient(connect, poll time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = (&net.Dialer{Timeout: connect, KeepAlive: tcpKeepAlive}).DialContext
@@ -282,10 +278,18 @@ func (c *Client) Stop() error {
 	return c.Shutdown(ctx)
 }
 
-// dispatch оборачивает обработчик: только текстовые сообщения, апдейт — признак живой связи.
+// dispatch оборачивает обработчик: только текстовые сообщения, апдейт - признак живой связи.
 func (c *Client) dispatch(handler Handler) bot.HandlerFunc {
 	return func(ctx context.Context, _ *bot.Bot, update *models.Update) {
 		c.markHealthy()
+
+		if update.CallbackQuery != nil {
+			if c.options.onCallback != nil {
+				c.options.onCallback(ctx, callbackFromUpdate(update))
+			}
+
+			return
+		}
 
 		if update.Message == nil || update.Message.Text == "" {
 			return
@@ -300,9 +304,7 @@ func (c *Client) dispatch(handler Handler) bot.HandlerFunc {
 	}
 }
 
-// onPollError обрабатывает ошибки polling: 401 — фатально, отмена и потеря апдейтов при
-// остановке игнорируются, 429 — не сбой связи, ошибки разбора пишутся коротко (без текста сообщения),
-// остальное — сбой связи.
+// onPollError обрабатывает ошибки polling и состояние связи.
 func (c *Client) onPollError(err error) {
 	text := err.Error()
 
@@ -424,15 +426,15 @@ func (c *Client) markHealthy() {
 	c.options.onConnection(true, "")
 }
 
-// Stats — счётчики клиента с момента запуска.
+// Stats - счётчики клиента с момента запуска.
 type Stats struct {
-	// Sent — доставлено сообщений.
+	// Sent - доставлено сообщений.
 	Sent uint64
-	// Dropped — выброшено сообщений: отклонены Telegram, переполнение очереди, отклонённый токен.
+	// Dropped - выброшено сообщений: отклонены Telegram, переполнение очереди, отклонённый токен.
 	Dropped uint64
-	// Queued — сообщений в очереди сейчас.
+	// Queued - сообщений в очереди сейчас.
 	Queued int
-	// Connected — связь с Bot API есть (последний запрос без ошибки связи).
+	// Connected - связь с Bot API есть (последний запрос без ошибки связи).
 	Connected bool
 }
 
@@ -449,4 +451,83 @@ func (c *Client) Stats() Stats {
 // mask заменяет токен в тексте на ***.
 func (c *Client) mask(text string) string {
 	return strings.ReplaceAll(text, c.token, "***")
+}
+
+// errorKind классифицирует ошибки пакета telegram.
+type errorKind int
+
+const (
+	kindUnknown errorKind = iota
+	kindUnauthorized
+	kindRateLimited
+	kindRejected
+	kindTransient
+	kindQueueFull
+	kindClosed
+	kindInvalidArgument
+	kindBusy
+)
+
+// Error - ошибка пакета telegram; текст никогда не содержит токен.
+type Error struct {
+	kind       errorKind
+	Op         string
+	Message    string
+	RetryAfter time.Duration
+}
+
+// Error возвращает текст ошибки.
+func (e *Error) Error() string {
+	if e.Op == "" {
+		return "telegram: " + e.Message
+	}
+
+	return "telegram: " + e.Op + ": " + e.Message
+}
+
+// Is сравнивает ошибки по виду.
+func (e *Error) Is(target error) bool {
+	t, ok := target.(*Error)
+	if !ok {
+		return false
+	}
+
+	return e.kind == t.kind
+}
+
+var (
+	// ErrBusy сообщает о занятых управляющих запросах.
+	ErrBusy = &Error{kind: kindBusy, Message: "control requests busy"}
+	// ErrUnauthorized сообщает, что Telegram отклонил токен.
+	ErrUnauthorized = &Error{kind: kindUnauthorized, Message: "unauthorized"}
+	// ErrRateLimited сообщает об ответе 429; RetryAfter - сколько ждать.
+	ErrRateLimited = &Error{kind: kindRateLimited, Message: "too many requests"}
+	// ErrRejected сообщает об окончательном отказе (400/403/404), повтор бессмыслен.
+	ErrRejected = &Error{kind: kindRejected, Message: "rejected"}
+	// ErrTransient сообщает о временной ошибке (сеть, 5xx), можно повторить.
+	ErrTransient = &Error{kind: kindTransient, Message: "temporary failure"}
+	// ErrQueueFull сообщает, что очередь переполнена и самое старое сообщение выброшено.
+	ErrQueueFull = &Error{kind: kindQueueFull, Message: "queue is full, oldest message dropped"}
+	// ErrClosed сообщает, что клиент остановлен.
+	ErrClosed = &Error{kind: kindClosed, Message: "client is closed"}
+	// ErrInvalidArgument сообщает о некорректном аргументе или опции.
+	ErrInvalidArgument = &Error{kind: kindInvalidArgument, Message: "invalid argument"}
+)
+
+// translate переводит ошибку go-telegram/bot в *Error пакета с замаскированным текстом.
+func translate(op string, err error, mask func(string) string) *Error {
+	message := mask(err.Error())
+
+	var tooMany *bot.TooManyRequestsError
+
+	switch {
+	case errors.As(err, &tooMany):
+		return &Error{kind: kindRateLimited, Op: op, Message: message, RetryAfter: time.Duration(tooMany.RetryAfter) * time.Second}
+	case errors.Is(err, bot.ErrorUnauthorized):
+		return &Error{kind: kindUnauthorized, Op: op, Message: message}
+	case errors.Is(err, bot.ErrorForbidden), errors.Is(err, bot.ErrorBadRequest), errors.Is(err, bot.ErrorNotFound):
+		return &Error{kind: kindRejected, Op: op, Message: message}
+	default:
+		return &Error{kind: kindTransient, Op: op, Message: message}
+	}
 }

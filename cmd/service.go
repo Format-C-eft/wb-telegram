@@ -8,8 +8,10 @@ import (
 
 	"github.com/Format-C-eft/wb-telegram/internal/app"
 	"github.com/Format-C-eft/wb-telegram/internal/bot"
+	"github.com/Format-C-eft/wb-telegram/internal/chart"
 	"github.com/Format-C-eft/wb-telegram/internal/config"
 	"github.com/Format-C-eft/wb-telegram/internal/telegram"
+	"github.com/Format-C-eft/wb-telegram/internal/wb_history"
 	"github.com/Format-C-eft/wb-telegram/internal/wbdevice"
 )
 
@@ -69,8 +71,7 @@ func runService(ctx context.Context, s serviceSettings) int {
 	return runBot(ctx, cfg, token, broker, s.apiURL)
 }
 
-// runBot собирает компоненты (wbdevice → telegram → bot), запускает их и переводит результат в код выхода.
-// Остановка — в обратном порядке: ядро, досылка очереди Telegram (до 5 с), устройство с meta/error "r".
+// runBot собирает компоненты и запускает сервис.
 func runBot(ctx context.Context, cfg *config.Config, token, broker, apiURL string) int {
 	application, errApp := app.New()
 	if errApp != nil {
@@ -101,8 +102,25 @@ func runBot(ctx context.Context, cfg *config.Config, token, broker, apiURL strin
 		return 1
 	}
 
+	history, errHistory := wb_history.New(wb_history.WithBroker(broker))
+	if errHistory != nil {
+		slog.Error("не удалось создать клиент истории", "err", errHistory)
+
+		return 1
+	}
+
+	builder, errBuilder := chart.New(history)
+	if errBuilder != nil {
+		slog.Error("не удалось создать построитель графиков", "err", errBuilder)
+
+		return 1
+	}
+
 	telegramOptions := []telegram.Option{
 		telegram.WithTimeouts(cfg.ConnectTimeout(), cfg.PollTimeout()),
+		telegram.WithCallbackHandler(func(handlerCtx context.Context, callback telegram.Callback) {
+			core.HandleCallback(handlerCtx, callback)
+		}),
 		telegram.WithOnFatal(application.Terminate),
 		telegram.WithOnDelivery(func(err error) { core.ReportDelivery(err) }),
 		telegram.WithOnConnection(func(ok bool, reason string) { core.ReportTelegram(ok, reason) }),
@@ -123,14 +141,14 @@ func runBot(ctx context.Context, cfg *config.Config, token, broker, apiURL strin
 
 	var errCore error
 
-	core, errCore = bot.New(cfg, device, client, bot.WithVersion(version))
+	core, errCore = bot.New(cfg, device, client, bot.WithVersion(version), bot.WithChartBuilder(builder))
 	if errCore != nil {
 		slog.Error("не удалось создать ядро бота", "err", errCore)
 
 		return 1
 	}
 
-	application.AddComponent(device, client, core)
+	application.AddComponent(device, history, client, core)
 
 	slog.Info("wb-telegram запущен", "version", version, "users", len(cfg.Users), "commands", len(cfg.Commands))
 

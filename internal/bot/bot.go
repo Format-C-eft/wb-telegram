@@ -1,3 +1,4 @@
+// Package bot реализует команды и доставку сообщений wb-telegram.
 package bot
 
 import (
@@ -25,11 +26,12 @@ const (
 
 // pendingCall — вызов команды, ожидающий ответа правила.
 type pendingCall struct {
-	chatID    int64
-	command   string
-	createdAt time.Time
-	answered  bool
-	stopTimer func() bool
+	chatID          int64
+	command         string
+	createdAt       time.Time
+	answered        bool
+	timeoutNotified bool
+	stopTimer       func() bool
 }
 
 // stop останавливает таймер ожидания ответа, если он запущен.
@@ -46,10 +48,20 @@ type Bot struct {
 	sender    Sender
 	options   options
 
-	mu      sync.Mutex
-	pending map[string]*pendingCall
-	cancel  context.CancelFunc
-	stopped bool
+	mu              sync.Mutex
+	pending         map[string]*pendingCall
+	cancel          context.CancelFunc
+	stopped         bool
+	operationCtx    context.Context
+	operationCancel context.CancelFunc
+	operations      sync.WaitGroup
+	stopDone        chan struct{}
+	panels          map[string]*buttonPanel
+	buttons         map[string]buttonAction
+	chartJobs       chan chartJob
+	chartWorkers    sync.WaitGroup
+	chartBusy       map[int64]bool
+	chartSeen       map[string]chartSeenEntry
 
 	// deliveryMu упорядочивает смену и публикацию флага ошибки доставки контрола send.
 	deliveryMu      sync.Mutex
@@ -79,19 +91,23 @@ func New(cfg *config.Config, publisher Publisher, sender Sender, opts ...Option)
 		return nil, errValidate
 	}
 
+	operationCtx, operationCancel := context.WithCancel(context.Background())
+
 	return &Bot{
-		cfg:       cfg,
-		publisher: publisher,
-		sender:    sender,
-		options:   o,
-		pending:   map[string]*pendingCall{},
-		stats:     serviceStats{startedAt: o.now()},
-		done:      make(chan struct{}),
+		cfg:          cfg,
+		publisher:    publisher,
+		sender:       sender,
+		options:      o,
+		pending:      map[string]*pendingCall{},
+		stats:        serviceStats{startedAt: o.now()},
+		done:         make(chan struct{}),
+		operationCtx: operationCtx, operationCancel: operationCancel, stopDone: make(chan struct{}),
+		panels: make(map[string]*buttonPanel), buttons: make(map[string]buttonAction),
+		chartJobs: make(chan chartJob, 8), chartBusy: make(map[int64]bool), chartSeen: make(map[string]chartSeenEntry),
 	}, nil
 }
 
-// Run в фоне устанавливает каждому пользователю меню доступных ему команд; не блокирует.
-// Повторный Run и Run после Stop возвращают ErrInvalidState.
+// Run запускает фоновые задачи и установку меню команд.
 func (b *Bot) Run(ctx context.Context) error {
 	b.mu.Lock()
 
@@ -103,8 +119,18 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	b.cancel = cancel
+	b.operations.Add(1)
+
+	if b.options.chartBuilder != nil {
+		b.chartWorkers.Add(1)
+	}
 
 	b.mu.Unlock()
+	defer b.operations.Done()
+
+	if b.options.chartBuilder != nil {
+		go b.chartLoop()
+	}
 
 	go func() {
 		defer close(b.done)
@@ -123,26 +149,29 @@ func (b *Bot) Run(ctx context.Context) error {
 	return nil
 }
 
-// Stop окончательно останавливает ядро: прекращает установку меню, останавливает таймеры
-// ожидания ответов и больше не принимает команды. Повторный Stop безопасен.
+// Stop завершает операции ядра и освобождает его состояние.
 func (b *Bot) Stop() error {
 	b.mu.Lock()
+	if b.stopped {
+		b.mu.Unlock()
+		<-b.stopDone
+
+		return nil
+	}
 
 	b.stopped = true
 	cancel := b.cancel
+	b.operationCancel()
 
 	for _, call := range b.pending {
 		call.stop()
 	}
-
 	b.mu.Unlock()
 
 	b.statsMu.Lock()
-
 	if b.stats.telegramStopTimer != nil {
 		b.stats.telegramStopTimer()
 	}
-
 	b.statsMu.Unlock()
 
 	if cancel != nil {
@@ -150,15 +179,32 @@ func (b *Bot) Stop() error {
 		<-b.done
 	}
 
+	b.operations.Wait()
+	b.chartWorkers.Wait()
+
+	b.mu.Lock()
+	clear(b.panels)
+	clear(b.buttons)
+	clear(b.chartBusy)
+	clear(b.chartSeen)
+	b.mu.Unlock()
+	close(b.stopDone)
+
 	return nil
 }
 
-// isStopped сообщает, вызван ли Stop.
-func (b *Bot) isStopped() bool {
+// beginOperation регистрирует операцию до закрытия приёма при остановке.
+func (b *Bot) beginOperation() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	return b.stopped
+	if b.stopped {
+		return false
+	}
+
+	b.operations.Add(1)
+
+	return true
 }
 
 // syncUserCommands устанавливает меню команд пользователю, повторяя при временных ошибках.
@@ -212,9 +258,7 @@ func toTelegramCommands(commands []config.Command) []telegram.Command {
 	return out
 }
 
-// deliver ставит сообщение в очередь отправки.
-// Переполнение очереди клиент уже сообщил через onDelivery и журнал, а новое сообщение поставил,
-// поэтому здесь оно не повторяется; прочие ошибки (клиент остановлен) только пишутся в журнал.
+// deliver ставит обычный текст в очередь отправки.
 func (b *Bot) deliver(chatID int64, text string) {
 	errSend := b.sender.Send(chatID, text)
 	if errSend == nil || errors.Is(errSend, telegram.ErrQueueFull) {
@@ -223,3 +267,48 @@ func (b *Bot) deliver(chatID int64, text string) {
 
 	slog.Error("Telegram: сообщение не поставлено в очередь", "chat_id", chatID, "err", errSend)
 }
+
+// errorKind классифицирует ошибки пакета bot.
+type errorKind int
+
+const (
+	kindUnknown errorKind = iota
+	kindInvalidArgument
+	kindBadPayload
+	kindInvalidState
+)
+
+// Error - ошибка пакета bot.
+type Error struct {
+	kind    errorKind
+	Op      string
+	Message string
+}
+
+// Error возвращает текст ошибки.
+func (e *Error) Error() string {
+	if e.Op == "" {
+		return "bot: " + e.Message
+	}
+
+	return "bot: " + e.Op + ": " + e.Message
+}
+
+// Is сравнивает ошибки по виду.
+func (e *Error) Is(target error) bool {
+	t, ok := target.(*Error)
+	if !ok {
+		return false
+	}
+
+	return e.kind == t.kind
+}
+
+var (
+	// ErrInvalidArgument сообщает о некорректном аргументе конструктора или опции.
+	ErrInvalidArgument = &Error{kind: kindInvalidArgument, Message: "invalid argument"}
+	// ErrBadPayload сообщает о некорректном сообщении от правил.
+	ErrBadPayload = &Error{kind: kindBadPayload, Message: "bad payload"}
+	// ErrInvalidState сообщает о вызове в неподходящем состоянии (повторный Run, Run после Stop).
+	ErrInvalidState = &Error{kind: kindInvalidState, Message: "invalid state"}
+)

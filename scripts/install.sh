@@ -5,7 +5,7 @@
 #   curl -fsSL https://github.com/Format-C-eft/wb-telegram/releases/latest/download/install.sh | sh
 #
 # Архитектура определяется сама: arm64 — WB8, armhf — WB6 и WB7.
-# Конкретная версия: WB_TELEGRAM_VERSION=v0.1.12 sh install.sh
+# Конкретная версия: WB_TELEGRAM_VERSION=v0.1.19 sh install.sh
 set -eu
 
 repo="Format-C-eft/wb-telegram"

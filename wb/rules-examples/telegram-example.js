@@ -5,8 +5,35 @@ var tg = require("telegram");
 
 // /gate — открыть ворота (замените канал реле на свой).
 tg.onCommand("gate", function (cmd) {
-  dev["wb-gpio/EXT1_R3A1"] = true;
-  cmd.reply("Ворота открываются (" + cmd.user + ")");
+  if (cmd.args === "open") {
+    dev["wb-gpio/EXT1_R3A1"] = true;
+    cmd.reply("Команда открытия передана");
+
+    return;
+  }
+
+  cmd.reply("Открыть ворота?", { buttons: [[
+    { text: "Открыть", command: "gate", args: "open" },
+    { text: "Отмена", cancel: true }
+  ]] });
+});
+
+// Пример форматированного сообщения с безопасной подстановкой значения.
+tg.onCommand("boiler_status", function (cmd) {
+  var temperature = String(dev["boiler/flow_temperature"]);
+
+  cmd.replyHTML("<b>Температура подачи:</b> " + tg.escapeHTML(temperature) + " °C");
+});
+
+// Пример запроса графика; канал иллюстративный, его нужно заменить на свой.
+tg.onCommand("boiler_graph", function (cmd) {
+  cmd.replyChart({
+    title: "Температура котла",
+    period_s: 86400,
+    channels: [
+      { device: "boiler", control: "temperature", label: "Подача", unit: "°C" }
+    ]
+  });
 });
 
 // /boiler — прислать состояние котла; /boiler 55 — задать температуру.
