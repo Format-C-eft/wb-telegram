@@ -171,6 +171,55 @@ func TestPhotoRetryReader(t *testing.T) {
 	}
 }
 
+// TestEphemeralPhoto проверяет привязку фото к callback без адреса чата.
+func TestEphemeralPhoto(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 4<<20)
+
+		errForm := r.ParseMultipartForm(4 << 20) //nolint:gosec // тело ограничено MaxBytesReader
+		if errForm != nil {
+			t.Error(errForm)
+
+			return
+		}
+
+		if _, present := r.Form["chat_id"]; present {
+			t.Error("ephemeral photo included chat_id")
+		}
+
+		if !strings.HasSuffix(r.URL.Path, "/sendPhoto") || r.FormValue("ephemeral_message_parameters") != `{"callback_query_id":"press-1"}` {
+			t.Error("wrong ephemeral photo parameters")
+		}
+
+		photo, header, errPhoto := r.FormFile("photo")
+		if errPhoto != nil {
+			t.Error(errPhoto)
+
+			return
+		}
+		defer photo.Close()
+
+		if header.Filename != "chart.png" {
+			t.Errorf("filename = %q", header.Filename)
+		}
+
+		writeResult(w, `{"message_id":0,"date":1,"chat":{"id":1,"type":"private"},"ephemeral_message_id":2}`)
+	}))
+	defer server.Close()
+
+	client, errNew := New(testToken, func(context.Context, Message) {}, WithServerURL(server.URL))
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+
+	errSend := client.SendEphemeral(t.Context(), "press-1", Delivery{Kind: DeliveryPhoto, PNG: []byte{1}, Caption: "Chart"})
+	if errSend != nil {
+		t.Fatal(errSend)
+	}
+}
+
 // TestCallbackUnion проверяет доступные, недоступные и inline нажатия.
 func TestCallbackUnion(t *testing.T) {
 	t.Parallel()
@@ -233,7 +282,10 @@ func TestControlRequests(t *testing.T) {
 		<-entered
 	}
 
-	errBusy := client.AnswerCallback(context.Background(), "overflow", "", false)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+
+	errBusy := client.AnswerCallback(ctx, "overflow", "", false)
 	if !errors.Is(errBusy, ErrBusy) {
 		t.Errorf("overflow = %v", errBusy)
 	}

@@ -11,16 +11,19 @@ on:
 permissions:
   contents: read
 
-# Новый push в ветку отменяет устаревший прогон; сборки master не прерываются.
+# Сборки master ждут завершения предыдущей сборки в очереди.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  group: ci-${{ github.ref == 'refs/heads/master' && github.ref || github.run_id }}
+  queue: max
 
 jobs:
   test:
     name: Тесты и линт
     if: github.ref != 'refs/heads/master'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-test-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v7
         with:
@@ -161,7 +164,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    concurrency: release
     steps:
       - uses: actions/checkout@v7
 
@@ -182,9 +184,17 @@ jobs:
           done
           cp scripts/install.sh dist/install.sh
 
+          tags=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))')
+          newest=$(printf '%s\n' "${tags}" "v${VERSION}" | sort -V | tail -n 1)
+          latest=false
+          if [ "$newest" = "v${VERSION}" ]; then
+            latest=true
+          fi
+
           gh release create "v${VERSION}" \
             --target "${GITHUB_SHA}" \
             --title "wb-telegram ${VERSION}" \
             --notes "Установка и обновление на контроллере: \`curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.sh | sh\`. arm64 — WB8, armhf — WB6/WB7." \
-            --latest \
+            --latest="${latest}" \
             dist/*.deb dist/install.sh

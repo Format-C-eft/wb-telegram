@@ -2,6 +2,8 @@ package bot
 
 import (
 	"testing"
+
+	"go.uber.org/mock/gomock"
 )
 
 // TestReplyWithFullPanelStoreReportsFailure сообщает об отказе панели и завершает ожидание ответа.
@@ -23,9 +25,9 @@ func TestReplyWithFullPanelStoreReportsFailure(t *testing.T) {
 		}
 	}
 
-	callGate(b, deps, 42, 100)
+	callGate(t, b, deps, 42, 100)
 	deps.sender.EXPECT().Send(int64(100), "Не удалось подготовить сообщение, повторите команду").Return(nil).Times(1)
-	deps.publisher.EXPECT().SetValue("send", "Открыть?").Return(nil).Times(1)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Открыть?").Return(nil).Times(1)
 
 	b.HandleSend([]byte(`{"reply_to":"42","text":"Открыть?","buttons":[[{"text":"Да","command":"gate","args":"open"}]]}`))
 

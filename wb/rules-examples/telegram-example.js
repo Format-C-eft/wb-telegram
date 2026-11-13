@@ -1,5 +1,5 @@
 // Пример правил для wb-telegram. Скопируйте в /etc/wb-rules/ и поправьте под свой дом.
-// Команды gate и boiler должны быть заведены в настройках бота (веб-интерфейс → Конфигурационные файлы → Telegram-бот).
+// Добавьте нужные команды в настройках бота (веб-интерфейс → Конфигурационные файлы → Telegram-бот).
 
 var tg = require("telegram");
 
@@ -18,22 +18,54 @@ tg.onCommand("gate", function (cmd) {
   ]] });
 });
 
-// Пример форматированного сообщения с безопасной подстановкой значения.
+// /boiler_status показывает карточку; замените каналы на свои.
 tg.onCommand("boiler_status", function (cmd) {
-  var temperature = String(dev["boiler/flow_temperature"]);
+  var temperature = dev["boiler/flow_temperature"];
+  var errorCode = dev["boiler/error_code"];
+  var status;
 
-  cmd.replyHTML("<b>Температура подачи:</b> " + tg.escapeHTML(temperature) + " °C");
+  if (temperature === undefined || temperature === null || temperature === "") {
+    temperature = "Недоступна";
+  } else {
+    temperature = String(temperature) + " °C";
+  }
+
+  if (errorCode === undefined || errorCode === null || errorCode === "") {
+    status = "Нет данных о состоянии";
+  } else if (String(errorCode) === "0") {
+    status = "Ошибок нет";
+  } else {
+    status = "Ошибка " + String(errorCode);
+  }
+
+  cmd.replyBoilerWidget({ temperature: temperature, status: status });
 });
 
 // Пример запроса графика; канал иллюстративный, его нужно заменить на свой.
 tg.onCommand("boiler_graph", function (cmd) {
-  cmd.replyChart({
+  if (cmd.args === "menu") {
+    cmd.reply("Показать историю температуры?", { buttons: [[
+      { text: "Показать график", command: "boiler_graph" }
+    ]] });
+
+    return;
+  }
+
+  var chart = {
     title: "Температура котла",
     period_s: 86400,
     channels: [
-      { device: "boiler", control: "temperature", label: "Подача", unit: "°C" }
+      { device: "boiler", control: "flow_temperature", label: "Подача", unit: "°C" }
     ]
-  });
+  };
+
+  if (cmd.canReplyEphemeral) {
+    cmd.replyEphemeralChart(chart);
+
+    return;
+  }
+
+  cmd.replyChart(chart);
 });
 
 // /boiler — прислать состояние котла; /boiler 55 — задать температуру.

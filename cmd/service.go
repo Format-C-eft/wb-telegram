@@ -121,6 +121,9 @@ func runBot(ctx context.Context, cfg *config.Config, token, broker, apiURL strin
 		telegram.WithCallbackHandler(func(handlerCtx context.Context, callback telegram.Callback) {
 			core.HandleCallback(handlerCtx, callback)
 		}),
+		telegram.WithWidgetQueryHandler(func(handlerCtx context.Context, query telegram.WidgetQuery) {
+			core.HandleWidgetQuery(handlerCtx, query)
+		}),
 		telegram.WithOnFatal(application.Terminate),
 		telegram.WithOnDelivery(func(err error) { core.ReportDelivery(err) }),
 		telegram.WithOnConnection(func(ok bool, reason string) { core.ReportTelegram(ok, reason) }),

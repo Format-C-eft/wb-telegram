@@ -12,11 +12,12 @@ import (
 )
 
 // callGate публикует вызов /gate от chatID с updateID.
-func callGate(b *Bot, deps testDeps, updateID, chatID int64) {
+func callGate(t *testing.T, b *Bot, deps testDeps, updateID, chatID int64) {
 	deps.publisher.EXPECT().Connected().Return(true)
-	deps.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).Return(nil)
 
 	b.HandleMessage(context.Background(), message(updateID, chatID, "/gate"))
+	waitForWorkers(t, b)
 }
 
 // TestHandleSendRecipients проверяет выбор получателей по виду payload.
@@ -49,7 +50,7 @@ func TestHandleSendRecipients(t *testing.T) {
 				calls = append(calls, deps.sender.EXPECT().Send(chat, tt.text).Return(nil))
 			}
 
-			calls = append(calls, deps.publisher.EXPECT().SetValue("send", tt.text).Return(nil))
+			calls = append(calls, deps.publisher.EXPECT().SetValue(gomock.Any(), "send", tt.text).Return(nil))
 
 			gomock.InOrder(calls...)
 
@@ -79,16 +80,16 @@ func TestHandleSendRoutesConcurrentCallers(t *testing.T) {
 
 	b, deps := newTestBot(t)
 
-	callGate(b, deps, 1, 100)
-	callGate(b, deps, 2, 200)
+	callGate(t, b, deps, 1, 100)
+	callGate(t, b, deps, 2, 200)
 
 	deps.sender.EXPECT().Send(int64(200), "Ворота открываются").Return(nil)
-	deps.publisher.EXPECT().SetValue("send", "Ворота открываются").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Ворота открываются").Return(nil)
 
 	b.HandleSend([]byte(`{"text":"Ворота открываются","reply_to":"2","id":"wbr-5"}`))
 
 	deps.sender.EXPECT().Send(int64(100), "Уже открыты").Return(nil)
-	deps.publisher.EXPECT().SetValue("send", "Уже открыты").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Уже открыты").Return(nil)
 
 	b.HandleSend([]byte(`{"text":"Уже открыты","reply_to":"1"}`))
 
@@ -103,10 +104,10 @@ func TestHandleSendReplyToWinsOverTo(t *testing.T) {
 
 	b, deps := newTestBot(t)
 
-	callGate(b, deps, 3, 200)
+	callGate(t, b, deps, 3, 200)
 
 	deps.sender.EXPECT().Send(int64(200), "Готово").Return(nil)
-	deps.publisher.EXPECT().SetValue("send", "Готово").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Готово").Return(nil)
 
 	b.HandleSend([]byte(`{"text":"Готово","reply_to":"3","to":["Супруга"]}`))
 }
@@ -117,14 +118,14 @@ func TestHandleSendLateAndRepeatedReplies(t *testing.T) {
 
 	b, deps := newTestBot(t)
 
-	callGate(b, deps, 7, 100)
+	callGate(t, b, deps, 7, 100)
 
 	deps.sender.EXPECT().Send(int64(100), "Команда /gate отправлена, ответа от правил нет").Return(nil)
 	deps.timers.fire(0)
 
 	for _, text := range []string{"Открываю", "Открыто"} {
 		deps.sender.EXPECT().Send(int64(100), text).Return(nil)
-		deps.publisher.EXPECT().SetValue("send", text).Return(nil)
+		deps.publisher.EXPECT().SetValue(gomock.Any(), "send", text).Return(nil)
 
 		b.HandleSend([]byte(`{"text":"` + text + `","reply_to":"7"}`))
 	}
@@ -135,7 +136,7 @@ func TestHandleSendUnknownReply(t *testing.T) {
 	t.Parallel()
 
 	b, deps := newTestBot(t)
-	deps.publisher.EXPECT().SetValue("send", "x").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "x").Return(nil)
 
 	b.HandleSend([]byte(`{"text":"x","reply_to":"404"}`))
 }
@@ -147,7 +148,7 @@ func TestHandleSendPublishFailure(t *testing.T) {
 	b, deps := newTestBot(t)
 
 	deps.sender.EXPECT().Send(int64(100), "x").Return(nil)
-	deps.publisher.EXPECT().SetValue("send", "x").Return(errors.New("no connection"))
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "x").Return(errors.New("no connection"))
 
 	b.HandleSend([]byte("x"))
 }
@@ -173,15 +174,17 @@ func TestReportDelivery(t *testing.T) {
 	b, deps := newTestBot(t)
 
 	gomock.InOrder(
-		deps.publisher.EXPECT().SetError("send", "w").Return(nil),
-		deps.publisher.EXPECT().SetError("send", "").Return(nil),
+		deps.publisher.EXPECT().SetError(gomock.Any(), "send", "w").Return(nil),
+		deps.publisher.EXPECT().SetError(gomock.Any(), "send", "").Return(nil),
 	)
 
 	b.ReportDelivery(nil)
 	b.ReportDelivery(telegram.ErrRejected)
 	b.ReportDelivery(errors.New("again"))
+	waitForDeliveryFlag(t, b)
 	b.ReportDelivery(nil)
 	b.ReportDelivery(nil)
+	waitForDeliveryFlag(t, b)
 }
 
 // TestReportDeliveryConcurrent проверяет, что при одновременных отчётах флаги публикуются строго
@@ -196,7 +199,7 @@ func TestReportDeliveryConcurrent(t *testing.T) {
 		published []string
 	)
 
-	deps.publisher.EXPECT().SetError("send", gomock.Any()).DoAndReturn(func(_, flags string) error {
+	deps.publisher.EXPECT().SetError(gomock.Any(), "send", gomock.Any()).DoAndReturn(func(_ context.Context, _, flags string) error {
 		mu.Lock()
 
 		published = append(published, flags)
@@ -223,6 +226,7 @@ func TestReportDeliveryConcurrent(t *testing.T) {
 	wg.Wait()
 
 	b.ReportDelivery(nil)
+	waitForDeliveryFlag(t, b)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -258,8 +262,22 @@ func TestHandleSendQueueFull(t *testing.T) {
 
 		return telegram.ErrQueueFull
 	})
-	deps.publisher.EXPECT().SetError("send", "w").Return(nil)
-	deps.publisher.EXPECT().SetValue("send", "x").Return(nil)
+	deps.publisher.EXPECT().SetError(gomock.Any(), "send", "w").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "x").Return(nil)
 
 	b.HandleSend([]byte("x"))
+	waitForDeliveryFlag(t, b)
+}
+
+// waitForDeliveryFlag ждёт публикации флага доставки.
+func waitForDeliveryFlag(t *testing.T, b *Bot) {
+	t.Helper()
+
+	b.deliveryMu.Lock()
+	done := b.deliveryDone
+	b.deliveryMu.Unlock()
+
+	if done != nil {
+		awaitSignal(t, done)
+	}
 }

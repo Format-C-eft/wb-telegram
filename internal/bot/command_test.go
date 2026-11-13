@@ -13,6 +13,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"github.com/Format-C-eft/wb-telegram/internal/telegram"
+	"github.com/Format-C-eft/wb-telegram/internal/wbdevice"
 )
 
 // message создаёт входящее сообщение от chatID с датой testNow.
@@ -65,6 +66,7 @@ func TestHandleMessageNoAccess(t *testing.T) {
 	deps.sender.EXPECT().Send(int64(999), "Нет доступа, ваш chat_id: 999").Return(nil)
 
 	b.HandleMessage(context.Background(), message(1, 999, "/gate"))
+	waitForWorkers(t, b)
 }
 
 // TestHandleMessageHelp проверяет справку только по доступным командам.
@@ -92,6 +94,7 @@ func TestHandleMessageHelp(t *testing.T) {
 			deps.sender.EXPECT().Send(tt.chatID, tt.want).Return(nil)
 
 			b.HandleMessage(context.Background(), message(1, tt.chatID, tt.text))
+			waitForWorkers(t, b)
 		})
 	}
 }
@@ -105,13 +108,14 @@ func TestHandleMessagePublishes(t *testing.T) {
 	var published string
 
 	deps.publisher.EXPECT().Connected().Return(true)
-	deps.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).DoAndReturn(func(_, value string) error {
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).DoAndReturn(func(_ context.Context, _, value string) error {
 		published = value
 
 		return nil
 	})
 
 	b.HandleMessage(context.Background(), message(42, 100, "/gate@MyHomeBot 22"))
+	waitForWorkers(t, b)
 
 	var got commandEvent
 
@@ -134,7 +138,7 @@ func TestHandleMessagePublishes(t *testing.T) {
 	}
 }
 
-// TestHandleMessageStaleBoundary проверяет границу устаревания: ровно reply_timeout — ещё не устарела.
+// TestHandleMessageStaleBoundary проверяет границу устаревания команды.
 func TestHandleMessageStaleBoundary(t *testing.T) {
 	t.Parallel()
 
@@ -144,7 +148,7 @@ func TestHandleMessageStaleBoundary(t *testing.T) {
 		stale bool
 	}{
 		{name: "fresh", age: 0},
-		{name: "exactly reply timeout", age: 10 * time.Second},
+		{name: "exactly reply timeout", age: 10 * time.Second, stale: true},
 		{name: "reply timeout plus second", age: 11 * time.Second, stale: true},
 	}
 
@@ -159,10 +163,11 @@ func TestHandleMessageStaleBoundary(t *testing.T) {
 				deps.sender.EXPECT().Send(int64(100), "Команда /gate устарела (отправлена 14:04), повторите").Return(nil)
 			} else {
 				deps.publisher.EXPECT().Connected().Return(true)
-				deps.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).Return(nil)
+				deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).Return(nil)
 			}
 
 			b.HandleMessage(context.Background(), msg)
+			waitForWorkers(t, b)
 		})
 	}
 }
@@ -203,7 +208,7 @@ func TestHandleMessageRejections(t *testing.T) {
 			msg:  message(1, 100, "/gate"),
 			prepare: func(d testDeps) {
 				d.publisher.EXPECT().Connected().Return(true)
-				d.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).Return(errors.New("timeout"))
+				d.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).Return(errors.New("timeout"))
 			},
 			want: "Контроллер недоступен, команда не выполнена",
 		},
@@ -222,6 +227,7 @@ func TestHandleMessageRejections(t *testing.T) {
 			deps.sender.EXPECT().Send(tt.msg.ChatID, tt.want).Return(nil)
 
 			b.HandleMessage(context.Background(), tt.msg)
+			waitForWorkers(t, b)
 
 			b.mu.Lock()
 			pending := len(b.pending)
@@ -246,6 +252,7 @@ func TestHandleMessageQueueFull(t *testing.T) {
 	deps.sender.EXPECT().Send(int64(999), gomock.Any()).Return(telegram.ErrQueueFull)
 
 	b.HandleMessage(context.Background(), message(1, 999, "/gate"))
+	waitForWorkers(t, b)
 }
 
 // TestReplyTimeout проверяет сообщение «ответа от правил нет» по таймеру.
@@ -255,11 +262,47 @@ func TestReplyTimeout(t *testing.T) {
 	b, deps := newTestBot(t)
 
 	deps.publisher.EXPECT().Connected().Return(true)
-	deps.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).Return(nil)
 	deps.sender.EXPECT().Send(int64(100), "Команда /gate отправлена, ответа от правил нет").Return(nil)
 
 	b.HandleMessage(context.Background(), message(42, 100, "/gate"))
+	waitForWorkers(t, b)
 	deps.timers.fire(0)
+}
+
+// TestUnconfirmedCommandAcceptsReply проверяет ответ правила после потери PUBACK.
+func TestUnconfirmedCommandAcceptsReply(t *testing.T) {
+	t.Parallel()
+
+	b, deps := newTestBot(t)
+	t.Cleanup(func() { _ = b.Stop() })
+
+	deps.publisher.EXPECT().Connected().Return(true)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).Return(wbdevice.ErrTimeout)
+	deps.sender.EXPECT().Send(int64(100), unconfirmedCommandText).Return(nil)
+
+	b.HandleMessage(t.Context(), message(42, 100, "/gate"))
+	waitForWorkers(t, b)
+
+	deps.sender.EXPECT().Send(int64(100), "Ворота открыты").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Ворота открыты").Return(nil)
+
+	b.HandleSend([]byte(`{"reply_to":"42","text":"Ворота открыты"}`))
+}
+
+// TestReplyExpiresWithoutNewCommands проверяет истечение срока корреляции в простое.
+func TestReplyExpiresWithoutNewCommands(t *testing.T) {
+	t.Parallel()
+
+	clock := &movableClock{now: testNow}
+	b, deps := newTestBot(t, withClock(clock.get))
+	t.Cleanup(func() { _ = b.Stop() })
+
+	callGate(t, b, deps, 42, 100)
+	clock.advance(b.options.pendingTTL + time.Second)
+
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Старый ответ").Return(nil)
+	b.HandleSend([]byte(`{"reply_to":"42","text":"Старый ответ"}`))
 }
 
 // TestStopStopsReplyTimers проверяет, что после Stop таймер ожидания ответа не срабатывает.
@@ -269,9 +312,10 @@ func TestStopStopsReplyTimers(t *testing.T) {
 	b, deps := newTestBot(t)
 
 	deps.publisher.EXPECT().Connected().Return(true)
-	deps.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).Return(nil)
 
 	b.HandleMessage(context.Background(), message(42, 100, "/gate"))
+	waitForWorkers(t, b)
 
 	errStop := b.Stop()
 	if errStop != nil {
@@ -293,6 +337,7 @@ func TestHandleMessageAfterStop(t *testing.T) {
 	}
 
 	b.HandleMessage(context.Background(), message(42, 100, "/gate"))
+	waitForWorkers(t, b)
 
 	if deps.timers.count() != 0 {
 		t.Fatalf("reply timer count = %d, want 0", deps.timers.count())

@@ -49,6 +49,7 @@ func TestCallbackRejectsInvalidOrigins(t *testing.T) {
 			deps.sender.EXPECT().AnswerCallback(gomock.Any(), test.callback.QueryID, test.answer, false).Return(nil)
 
 			b.HandleCallback(context.Background(), test.callback)
+			waitForWorkers(t, b)
 		})
 	}
 }
@@ -82,7 +83,7 @@ func TestQueueFullKeepsAcceptedButtonPanel(t *testing.T) {
 
 		return telegram.ErrQueueFull
 	})
-	deps.publisher.EXPECT().SetValue("send", "Выбрать").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Выбрать").Return(nil)
 	b.HandleSend([]byte(`{"text":"Выбрать","buttons":[[{"text":"Открыть","command":"gate"}]]}`))
 
 	if len(b.panels) != 1 {
@@ -92,8 +93,9 @@ func TestQueueFullKeepsAcceptedButtonPanel(t *testing.T) {
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), "q", "Принято", false).Return(nil)
 	deps.sender.EXPECT().ClearKeyboard(gomock.Any(), int64(100), 7).Return(nil)
 	deps.publisher.EXPECT().Connected().Return(true)
-	deps.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).Return(nil)
 	b.HandleCallback(context.Background(), telegram.Callback{UpdateID: 11, QueryID: "q", FromID: 100, ChatID: 100, ChatType: "private", MessageID: 7, Data: token, Accessible: true})
+	waitForWorkers(t, b)
 }
 
 // TestCallbackAckFailureDoesNotReplay проверяет однократность действия при ошибке ACK.
@@ -111,13 +113,16 @@ func TestCallbackAckFailureDoesNotReplay(t *testing.T) {
 	deps.sender.EXPECT().ClearKeyboard(gomock.Any(), int64(100), 7).Return(nil)
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), "retry", "Кнопка больше не действует", false).Return(nil)
 	deps.publisher.EXPECT().Connected().Return(true).Times(1)
-	deps.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).Return(nil).Times(1)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).Return(nil).Times(1)
 
 	callback := telegram.Callback{UpdateID: 11, FromID: 100, ChatID: 100, ChatType: "private", MessageID: 7, Data: panel.keyboard[0][0].Data, Accessible: true}
 	callback.QueryID = "first"
 	b.HandleCallback(context.Background(), callback)
+	waitForWorkers(t, b)
+
 	callback.QueryID = "retry"
 	b.HandleCallback(context.Background(), callback)
+	waitForWorkers(t, b)
 }
 
 // TestDisconnectedCallbackConsumesWithoutPublishing не повторяет вызов после восстановления MQTT.
@@ -140,8 +145,11 @@ func TestDisconnectedCallbackConsumesWithoutPublishing(t *testing.T) {
 	callback := telegram.Callback{UpdateID: 11, FromID: 100, ChatID: 100, ChatType: "private", MessageID: 7, Data: panel.keyboard[0][0].Data, Accessible: true}
 	callback.QueryID = "first"
 	b.HandleCallback(context.Background(), callback)
+	waitForWorkers(t, b)
+
 	callback.QueryID = "retry"
 	b.HandleCallback(context.Background(), callback)
+	waitForWorkers(t, b)
 }
 
 // TestRecipientsGetDistinctKeyboardTokens изолирует токены кнопок для каждого адресата.
@@ -157,7 +165,7 @@ func TestRecipientsGetDistinctKeyboardTokens(t *testing.T) {
 
 		return nil
 	}).Times(2)
-	deps.publisher.EXPECT().SetValue("send", "Выбрать").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Выбрать").Return(nil)
 	b.HandleSend([]byte(`{"text":"Выбрать","to":["Супруга","Ребёнок"],"buttons":[[{"text":"Открыть","command":"gate"}]]}`))
 
 	if tokens[100] == "" || tokens[200] == "" || tokens[100] == tokens[200] {
@@ -166,14 +174,17 @@ func TestRecipientsGetDistinctKeyboardTokens(t *testing.T) {
 
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), "wrong", "Кнопка недоступна", false).Return(nil)
 	b.HandleCallback(context.Background(), telegram.Callback{QueryID: "wrong", FromID: 200, ChatID: 200, ChatType: "private", Data: tokens[100], Accessible: true})
+	waitForWorkers(t, b)
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), "wife", "Принято", false).Return(nil)
 	deps.sender.EXPECT().ClearKeyboard(gomock.Any(), int64(100), 7).Return(nil)
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), "child", "Принято", false).Return(nil)
 	deps.sender.EXPECT().ClearKeyboard(gomock.Any(), int64(200), 8).Return(nil)
 	deps.publisher.EXPECT().Connected().Return(true).Times(2)
-	deps.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).Return(nil).Times(2)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).Return(nil).Times(2)
 	b.HandleCallback(context.Background(), telegram.Callback{UpdateID: 12, QueryID: "wife", FromID: 100, ChatID: 100, ChatType: "private", MessageID: 7, Data: tokens[100], Accessible: true})
+	waitForWorkers(t, b)
 	b.HandleCallback(context.Background(), telegram.Callback{UpdateID: 13, QueryID: "child", FromID: 200, ChatID: 200, ChatType: "private", MessageID: 8, Data: tokens[200], Accessible: true})
+	waitForWorkers(t, b)
 }
 
 // TestButtonPanelPerUserLimit ограничивает число одновременно активных панелей пользователя.

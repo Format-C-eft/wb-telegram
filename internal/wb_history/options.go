@@ -1,8 +1,9 @@
 package wb_history
 
 import (
-	"net/url"
 	"slices"
+
+	paho "github.com/eclipse/paho.mqtt.golang"
 )
 
 // Option настраивает клиент истории.
@@ -11,12 +12,17 @@ type options struct{ broker string }
 
 // Validate проверяет адрес брокера.
 func (o options) Validate() error {
-	parsed, errParse := url.Parse(o.broker)
-	if errParse != nil {
+	if o.broker == "" {
 		return ErrInvalidArgument
 	}
 
-	if !slices.Contains([]string{"tcp", "ssl", "tls", "ws", "wss", "unix"}, parsed.Scheme) || (parsed.Host == "" && parsed.Path == "") {
+	servers := paho.NewClientOptions().AddBroker(o.broker).Servers
+	if len(servers) != 1 {
+		return ErrInvalidArgument
+	}
+
+	server := servers[0]
+	if !slices.Contains([]string{"tcp", "mqtt", "ssl", "tls", "mqtts", "mqtt+ssl", "tcps", "ws", "wss", "unix"}, server.Scheme) || (server.Host == "" && server.Path == "") {
 		return ErrInvalidArgument
 	}
 

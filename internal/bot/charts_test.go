@@ -47,6 +47,73 @@ func awaitSignal(t *testing.T, signal <-chan struct{}) {
 	}
 }
 
+// TestEphemeralChartDelivery проверяет отправку графика нажавшему пользователю.
+func TestEphemeralChartDelivery(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	builder := mock.NewMockChartBuilder(ctrl)
+	result := chart.Result{PNG: []byte("png"), Caption: "Температура"}
+	builder.EXPECT().Build(gomock.Any(), gomock.Any(), testNow).Return(result, nil)
+
+	b, deps := startChartBot(t, builder)
+	if !b.track("50", 100, "gate", testNow, commandSource{callbackID: "press"}) {
+		t.Fatal("command was not tracked")
+	}
+
+	delivered := make(chan struct{})
+
+	deps.sender.EXPECT().SendEphemeral(gomock.Any(), "press", telegram.Delivery{
+		Kind: telegram.DeliveryPhoto, PNG: result.PNG, Caption: result.Caption,
+	}).DoAndReturn(func(_ context.Context, _ string, _ telegram.Delivery) error {
+		close(delivered)
+
+		return nil
+	})
+
+	b.HandleSend([]byte(`{"reply_to":"50","ephemeral":true,"chart":{"title":"Температура","period_s":3600,"channels":[{"device":"boiler","control":"temperature","label":"Подача","unit":"C"}]}}`))
+	awaitSignal(t, delivered)
+}
+
+// TestEphemeralChartBusy проверяет ответ при занятом обычным графиком построителе.
+func TestEphemeralChartBusy(t *testing.T) {
+	t.Parallel()
+
+	builder := mock.NewMockChartBuilder(gomock.NewController(t))
+	started := make(chan struct{})
+
+	builder.EXPECT().Build(gomock.Any(), gomock.Any(), testNow).
+		DoAndReturn(func(ctx context.Context, _ chart.Spec, _ time.Time) (chart.Result, error) {
+			close(started)
+			<-ctx.Done()
+
+			return chart.Result{}, chart.ErrCanceled
+		})
+
+	b, deps := startChartBot(t, builder)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Температура").Return(nil)
+	b.HandleSend([]byte(chartPayload))
+	awaitSignal(t, started)
+
+	if !b.track("50", 200, "gate", testNow, commandSource{callbackID: "press"}) {
+		t.Fatal("command was not tracked")
+	}
+
+	answered := make(chan struct{})
+
+	deps.sender.EXPECT().SendEphemeral(gomock.Any(), "press", telegram.Delivery{
+		Kind: telegram.DeliveryText,
+		Text: "График пока недоступен: обработка занята или история не подключена",
+	}).DoAndReturn(func(context.Context, string, telegram.Delivery) error {
+		close(answered)
+
+		return nil
+	})
+
+	b.HandleSend([]byte(`{"reply_to":"50","ephemeral":true,"chart":{"title":"Температура","period_s":3600,"channels":[{"device":"boiler","control":"temperature","label":"Подача","unit":"C"}]}}`))
+	awaitSignal(t, answered)
+}
+
 // TestChartDoesNotBlockText не задерживает обычный ответ во время чтения истории.
 func TestChartDoesNotBlockText(t *testing.T) {
 	t.Parallel()
@@ -67,8 +134,8 @@ func TestChartDoesNotBlockText(t *testing.T) {
 		}
 	})
 	b, deps := startChartBot(t, builder)
-	deps.publisher.EXPECT().SetValue("send", "Температура").Return(nil)
-	deps.publisher.EXPECT().SetValue("send", "Обычный текст").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Температура").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Обычный текст").Return(nil)
 	deps.sender.EXPECT().Send(int64(100), "Обычный текст").Return(nil)
 	deps.sender.EXPECT().SendDelivery(int64(100), gomock.Any()).DoAndReturn(func(_ int64, d telegram.Delivery) error {
 		if d.Kind != telegram.DeliveryPhoto || d.Caption != "Температура" {
@@ -101,7 +168,7 @@ func TestChartStopCancelsHistory(t *testing.T) {
 		return chart.Result{}, chart.ErrCanceled
 	})
 	b, deps := startChartBot(t, builder)
-	deps.publisher.EXPECT().SetValue("send", "Температура").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Температура").Return(nil)
 	b.HandleSend([]byte(chartPayload))
 	awaitSignal(t, started)
 
@@ -121,7 +188,7 @@ func TestChartDeduplicatesRequest(t *testing.T) {
 
 	builder.EXPECT().Build(gomock.Any(), gomock.Any(), gomock.Any()).Return(chart.Result{PNG: []byte("png")}, nil)
 	b, deps := startChartBot(t, builder)
-	deps.publisher.EXPECT().SetValue("send", "Температура").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Температура").Return(nil)
 	deps.sender.EXPECT().SendDelivery(int64(100), gomock.Any()).DoAndReturn(func(_ int64, _ telegram.Delivery) error {
 		close(delivered)
 
@@ -145,8 +212,8 @@ func TestChartReplyClosesTimer(t *testing.T) {
 		return chart.Result{}, chart.ErrCanceled
 	})
 	b, deps := startChartBot(t, builder)
-	callGate(b, deps, 10, 100)
-	deps.publisher.EXPECT().SetValue("send", "Температура").Return(nil)
+	callGate(t, b, deps, 10, 100)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Температура").Return(nil)
 	b.HandleSend([]byte(`{"reply_to":"10","chart":{"title":"Температура","period_s":3600,"channels":[{"device":"boiler","control":"temperature","label":"Подача"}]}}`))
 	awaitSignal(t, started)
 	b.mu.Lock()
@@ -211,7 +278,7 @@ func TestChartLateReply(t *testing.T) {
 	builder := mock.NewMockChartBuilder(gomock.NewController(t))
 	builder.EXPECT().Build(gomock.Any(), gomock.Any(), gomock.Any()).Return(chart.Result{PNG: []byte("png")}, nil)
 	b, deps := startChartBot(t, builder)
-	callGate(b, deps, 10, 100)
+	callGate(t, b, deps, 10, 100)
 
 	timeoutEntered := make(chan struct{})
 	releaseTimeout := make(chan struct{})
@@ -228,7 +295,7 @@ func TestChartLateReply(t *testing.T) {
 
 		return nil
 	})
-	deps.publisher.EXPECT().SetValue("send", "Температура").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Температура").Return(nil)
 	deps.sender.EXPECT().SendDelivery(int64(100), gomock.Any()).DoAndReturn(func(_ int64, _ telegram.Delivery) error {
 		close(delivered)
 
@@ -269,7 +336,7 @@ func TestChartFailureReportsText(t *testing.T) {
 			b, deps := startChartBot(t, builder)
 			done := make(chan struct{})
 
-			deps.publisher.EXPECT().SetValue("send", "Температура").Return(nil)
+			deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Температура").Return(nil)
 			deps.sender.EXPECT().Send(int64(100), tc.text).DoAndReturn(func(_ int64, _ string) error {
 				close(done)
 

@@ -13,6 +13,7 @@ type Option func(*options)
 // options - настройки Client.
 type options struct {
 	onCallback      CallbackHandler
+	onWidgetQuery   func(context.Context, WidgetQuery)
 	serverURL       string
 	connectTimeout  time.Duration
 	pollTimeout     time.Duration
@@ -78,7 +79,7 @@ func WithTimeouts(connect, poll time.Duration) Option {
 	}
 }
 
-// WithOnConnection задаёт потокобезопасный обработчик изменения состояния связи.
+// WithOnConnection задаёт последовательный обработчик связи, который не должен вызывать запросы к API клиента.
 func WithOnConnection(f func(ok bool, reason string)) Option {
 	return func(o *options) { o.onConnection = f }
 }
@@ -122,4 +123,9 @@ func withSleep(f func(ctx context.Context, d time.Duration) bool) Option {
 // WithCallbackHandler задаёт обработчик нажатий кнопок.
 func WithCallbackHandler(handler CallbackHandler) Option {
 	return func(o *options) { o.onCallback = handler }
+}
+
+// WithWidgetQueryHandler задаёт обработчик запросов виджетов.
+func WithWidgetQueryHandler(handler func(context.Context, WidgetQuery)) Option {
+	return func(o *options) { o.onWidgetQuery = handler }
 }

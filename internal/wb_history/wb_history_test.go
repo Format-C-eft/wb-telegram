@@ -183,7 +183,7 @@ func TestLifecycle(t *testing.T) {
 		t.Fatal(errBusy)
 	}
 
-	client.onLost(nil, errors.New("lost"))
+	client.onReconnecting(nil, nil)
 
 	if !errors.Is(<-result, ErrUnavailable) {
 		t.Fatal("disconnect did not cancel pending")

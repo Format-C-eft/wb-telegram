@@ -49,8 +49,8 @@ func callbackFromUpdate(update *models.Update) Callback {
 	return callback
 }
 
-// controlRequest ограничивает длительность и параллелизм управляющих запросов.
-func (c *Client) controlRequest(ctx context.Context, op string, request func(context.Context) error) error {
+// runControlRequest выполняет управляющий запрос с ограничением параллелизма.
+func (c *Client) runControlRequest(ctx context.Context, op string, request func(context.Context) error) error {
 	if ctx.Err() != nil {
 		return translate(op, ctx.Err(), c.mask)
 	}
@@ -65,16 +65,21 @@ func (c *Client) controlRequest(ctx context.Context, op string, request func(con
 
 	select {
 	case c.control <- struct{}{}:
-		defer func() { <-c.control }()
-	default:
+	case <-ctx.Done():
 		return ErrBusy
 	}
+
+	defer func() { <-c.control }()
 
 	requestCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	errRequest := request(requestCtx)
 	if errRequest != nil {
+		if ctx.Err() != nil {
+			return translate(op, errRequest, c.mask)
+		}
+
 		return c.fail(op, errRequest)
 	}
 
@@ -89,10 +94,30 @@ func (c *Client) AnswerCallback(ctx context.Context, queryID, text string, alert
 		return ErrInvalidArgument
 	}
 
-	return c.controlRequest(ctx, "answer callback", func(requestCtx context.Context) error {
+	return c.runControlRequest(ctx, "answer callback", func(requestCtx context.Context) error {
 		_, errAnswer := c.api.AnswerCallbackQuery(requestCtx, &bot.AnswerCallbackQueryParams{CallbackQueryID: queryID, Text: text, ShowAlert: alert})
 
 		return errAnswer
+	})
+}
+
+// SendEphemeral отправляет временный ответ на кнопку в обход очереди.
+func (c *Client) SendEphemeral(ctx context.Context, queryID string, delivery Delivery) error {
+	if queryID == "" || len(delivery.Keyboard) != 0 || (delivery.Kind != DeliveryText && delivery.Kind != DeliveryPhoto) {
+		return ErrInvalidArgument
+	}
+
+	errValidate := delivery.validate()
+	if errValidate != nil {
+		return errValidate
+	}
+
+	if delivery.Kind == DeliveryText && delivery.ParseMode == ParseModePlain {
+		delivery.Text = truncate(delivery.Text)
+	}
+
+	return c.runControlRequest(ctx, "send ephemeral", func(requestCtx context.Context) error {
+		return c.sendAttempt(requestCtx, outgoing{text: delivery.Text, delivery: delivery}, queryID)
 	})
 }
 
@@ -102,7 +127,7 @@ func (c *Client) ClearKeyboard(ctx context.Context, chatID int64, messageID int)
 		return ErrInvalidArgument
 	}
 
-	return c.controlRequest(ctx, "clear keyboard", func(requestCtx context.Context) error {
+	return c.runControlRequest(ctx, "clear keyboard", func(requestCtx context.Context) error {
 		_, errClear := c.api.EditMessageReplyMarkup(requestCtx, &bot.EditMessageReplyMarkupParams{ChatID: chatID, MessageID: messageID, ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{}}})
 
 		return errClear

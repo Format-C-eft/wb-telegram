@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"go.uber.org/mock/gomock"
 
+	"github.com/Format-C-eft/wb-telegram/internal/config"
 	"github.com/Format-C-eft/wb-telegram/internal/telegram"
 )
 
@@ -16,6 +18,23 @@ import (
 type movableClock struct {
 	mu  sync.Mutex
 	now time.Time
+}
+
+// TestSyncFullCommandMenu проверяет лимит Telegram при доступном /status.
+func TestSyncFullCommandMenu(t *testing.T) {
+	t.Parallel()
+
+	b, deps := newTestBot(t)
+	user := b.cfg.Users[0]
+	b.cfg.Commands = make([]config.Command, config.MaxCommands)
+
+	for index := range b.cfg.Commands {
+		b.cfg.Commands[index] = config.Command{Name: "command_" + strconv.Itoa(index), Description: "Команда"}
+	}
+
+	deps.sender.EXPECT().SetCommands(gomock.Any(), user.ChatID, toTelegramCommands(b.cfg.Commands)).Return(nil)
+
+	b.syncUserCommands(t.Context(), user)
 }
 
 // get возвращает текущее время часов.
@@ -134,6 +153,7 @@ func TestStatusAccess(t *testing.T) {
 			})
 
 			b.HandleMessage(context.Background(), message(1, tt.chatID, "/status"))
+			waitForWorkers(t, b)
 		})
 	}
 }
@@ -148,14 +168,17 @@ func TestStatusText(t *testing.T) {
 	deps.sender.EXPECT().Send(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 	deps.sender.EXPECT().Stats().Return(telegram.Stats{Sent: 42, Dropped: 1, Queued: 2, Connected: true})
 	deps.publisher.EXPECT().Connected().Return(true).AnyTimes()
-	deps.publisher.EXPECT().SetValue(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	deps.publisher.EXPECT().SetValue(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 
 	clock.advance(2 * time.Hour)
 
 	b.HandleMessage(context.Background(), staleMessage(clock.get()))
+	waitForWorkers(t, b)
 	b.HandleMessage(context.Background(), messageAt(5, 100, "/gate", clock.get()))
+	waitForWorkers(t, b)
 	deps.timers.fire(0)
 	b.HandleMessage(context.Background(), messageAt(6, 100, "/boiler", clock.get()))
+	waitForWorkers(t, b)
 	clock.advance(400 * time.Millisecond)
 	b.HandleSend([]byte(`{"text":"ok","reply_to":"6"}`))
 

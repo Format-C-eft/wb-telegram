@@ -91,7 +91,7 @@ func (c *Client) Read(ctx context.Context, query Query) ([]Point, error) {
 		return nil, contextError(requestContext)
 	}
 
-	if c.closed || !c.ready || c.pending != current {
+	if c.closed || !c.ready || c.pending != current || !c.client.IsConnectionOpen() {
 		c.mu.Unlock()
 
 		return nil, ErrUnavailable
@@ -159,7 +159,7 @@ func (c *Client) reserve(query Query) (*pending, error) {
 		return nil, ErrClosed
 	}
 
-	if !c.ready {
+	if !c.ready || !c.client.IsConnectionOpen() {
 		c.mu.Unlock()
 
 		return nil, ErrUnavailable

@@ -84,6 +84,61 @@ func TestDispatchDeliversTextMessages(t *testing.T) {
 	}
 }
 
+// TestDispatchOrdersCommandsAndChecksRecipient проверяет порядок и адресата групповых команд.
+func TestDispatchOrdersCommandsAndChecksRecipient(t *testing.T) {
+	t.Parallel()
+
+	api := newFakeAPI(t)
+	delivered := make(chan string, 3)
+
+	unblock := make(chan struct{}, 1)
+	defer close(unblock)
+
+	started := make(chan struct{}, 1)
+
+	api.queueRawUpdate(`{"update_id":41,"message":{"message_id":1,"date":1,"chat":{"id":-100,"type":"group"},"text":"/gate@OtherBot"}}`)
+	api.queueRawUpdate(`{"update_id":42,"message":{"message_id":2,"date":1,"chat":{"id":-100,"type":"group"},"text":"/gate@myhomebot"}}`)
+	api.queueRawUpdate(`{"update_id":43,"message":{"message_id":3,"date":1,"chat":{"id":-100,"type":"group"},"text":"/gate 2"}}`)
+
+	startClient(t, api, func(ctx context.Context, msg Message) {
+		if msg.UpdateID == 42 {
+			started <- struct{}{}
+
+			select {
+			case <-unblock:
+			case <-ctx.Done():
+			}
+		}
+
+		delivered <- msg.Text
+	})
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first addressed command did not start")
+	}
+
+	select {
+	case text := <-delivered:
+		t.Fatalf("unexpected command before first handler returned: %s", text)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	unblock <- struct{}{}
+
+	for _, want := range []string{"/gate@myhomebot", "/gate 2"} {
+		select {
+		case got := <-delivered:
+			if got != want {
+				t.Fatalf("command = %q, want %q", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("command %q was not delivered", want)
+		}
+	}
+}
+
 // TestDispatchIgnoresNonText проверяет, что сообщения без текста не доходят до обработчика.
 func TestDispatchIgnoresNonText(t *testing.T) {
 	t.Parallel()

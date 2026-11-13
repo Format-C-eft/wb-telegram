@@ -80,7 +80,8 @@ func (f *interactionTelegram) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if method == "sendMessage" || method == "sendPhoto" || method == "editMessageReplyMarkup" {
+	switch method {
+	case "sendMessage", "sendPhoto", "sendWidget", "editMessageReplyMarkup":
 		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":77,"date":1,"chat":{"id":100,"type":"private"}}}`)
 
 		return
@@ -145,13 +146,17 @@ func startInteractionService(t *testing.T) (*interactionTelegram, *runningServic
 	api := httptest.NewServer(tg)
 	t.Cleanup(api.Close)
 
-	configPath, tokenPath := writeFiles(t, `{"enabled":true,"reply_timeout_s":10,"users":[{"name":"Tester","chat_id":100,"notifications":true}],"commands":[{"name":"gate","description":"Gate"}]}`, "123:secret")
+	configPath, tokenPath := writeFiles(t, `{"enabled":true,"reply_timeout_s":10,"users":[{"name":"Tester","chat_id":100,"notifications":true}],"commands":[{"name":"gate","description":"Gate"},{"name":"boiler_status","description":"Boiler status"}]}`, "123:secret")
 	svc := &runningService{rule: connectClient(t, broker, "interaction-rule"), calls: make(chan string, 16), done: make(chan int, 1)}
-	subscribe(t, svc.rule, "/devices/telegram_bot/controls/cmd_gate", func(_ paho.Client, m paho.Message) {
-		if payload := string(m.Payload()); payload != "" && payload != "{}" {
-			svc.calls <- payload
-		}
-	})
+
+	for _, command := range []string{"gate", "boiler_status"} {
+		subscribe(t, svc.rule, "/devices/telegram_bot/controls/cmd_"+command, func(_ paho.Client, m paho.Message) {
+			if payload := string(m.Payload()); payload != "" && payload != "{}" {
+				svc.calls <- payload
+			}
+		})
+	}
+
 	subscribe(t, svc.rule, "/devices/telegram_bot/meta/error", func(_ paho.Client, m paho.Message) {
 		value := string(m.Payload())
 
@@ -204,6 +209,8 @@ func awaitInteractionCall(t *testing.T, svc *runningService) map[string]string {
 
 			fields[key] = value
 		}
+
+		fields["can_reply_ephemeral"] = string(call["can_reply_ephemeral"])
 
 		return fields
 	case <-time.After(10 * time.Second):
@@ -265,8 +272,24 @@ func TestRunServiceInlineInteraction(t *testing.T) {
 	}
 
 	selected := awaitInteractionCall(t, svc)
-	if selected["args"] != "open" || selected["user"] != "Tester" || selected["id"] != "43" {
+	if selected["args"] != "open" || selected["id"] != "43" || selected["can_reply_ephemeral"] != "true" {
 		t.Fatalf("callback command: %v", selected)
+	}
+
+	publish(t, svc.rule, "/devices/telegram_bot/controls/send/on", `{"reply_to":"43","text":"Temporary result","ephemeral":true}`, false)
+	ephemeral := tg.awaitRequest(t, "sendMessage", "Temporary result")
+
+	var ephemeralParameters struct {
+		CallbackQueryID string `json:"callback_query_id"`
+	}
+
+	errEphemeral := json.Unmarshal([]byte(ephemeral.fields["ephemeral_message_parameters"]), &ephemeralParameters)
+	if errEphemeral != nil {
+		t.Fatal(errEphemeral)
+	}
+
+	if _, hasChat := ephemeral.fields["chat_id"]; hasChat || ephemeralParameters.CallbackQueryID != "query-43" {
+		t.Fatalf("ephemeral message parameters: %+v", ephemeral.fields)
 	}
 
 	tg.push(callback)
@@ -276,6 +299,55 @@ func TestRunServiceInlineInteraction(t *testing.T) {
 	case duplicate := <-svc.calls:
 		t.Fatalf("duplicate MQTT command: %s", duplicate)
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestRunServiceWidgetInteraction проверяет обновление данных виджета через MQTT.
+func TestRunServiceWidgetInteraction(t *testing.T) {
+	t.Parallel()
+
+	tg, svc, _ := startInteractionService(t)
+	tg.push(fmt.Sprintf(`{"update_id":50,"message":{"message_id":1,"date":%d,"chat":{"id":100,"type":"private"},"text":"/boiler_status"}}`, time.Now().Unix()))
+
+	call := awaitInteractionCall(t, svc)
+	if call["id"] != "50" || call["user"] != "Tester" {
+		t.Fatalf("widget command: %v", call)
+	}
+
+	publish(t, svc.rule, "/devices/telegram_bot/controls/send/on", `{"reply_to":"50","boiler_widget":{"temperature":"50 °C","status":"Работает"}}`, false)
+
+	sent := tg.awaitRequest(t, "sendWidget", "")
+	if sent.fields["chat_id"] != "100" || sent.fields["allow_queries"] != "true" || !strings.Contains(sent.fields["chat_data"], "50 °C") {
+		t.Fatalf("widget message: %v", sent.fields["chat_data"])
+	}
+
+	tg.push(`{"update_id":51,"widget_query":{"id":"widget-51","from":{"id":100},"chat":{"id":100,"type":"private"},"message_id":77,"type":{"type":"data"},"data":"refresh"}}`)
+
+	refresh := awaitInteractionCall(t, svc)
+	if refresh["id"] != "51" || refresh["user"] != "Tester" {
+		t.Fatalf("widget command: %v", refresh)
+	}
+
+	publish(t, svc.rule, "/devices/telegram_bot/controls/send/on", `{"reply_to":"51","boiler_widget":{"temperature":"54 °C","status":"Работает"}}`, false)
+	answer := tg.awaitRequest(t, "answerWidgetQuery", "")
+
+	var widgetData struct {
+		Temperature string `json:"temperature"`
+		Status      string `json:"status"`
+	}
+
+	errData := json.Unmarshal([]byte(answer.fields["data"]), &widgetData)
+	if errData != nil {
+		t.Fatal(errData)
+	}
+
+	if answer.fields["widget_query_id"] != "widget-51" || widgetData.Temperature != "54 °C" || widgetData.Status != "Работает" {
+		t.Fatalf("widget answer: %+v, data: %+v", answer.fields, widgetData)
+	}
+
+	edit := tg.awaitRequest(t, "editMessageWidgetData", "")
+	if edit.fields["chat_id"] != "100" || edit.fields["message_id"] != "77" || edit.fields["chat_data"] != answer.fields["data"] {
+		t.Fatalf("widget edit: %+v", edit.fields)
 	}
 }
 

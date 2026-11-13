@@ -14,6 +14,46 @@ type connectionLog struct {
 	events []string
 }
 
+// TestConnectionCallbacksKeepOrder проверяет порядок событий сбоя и восстановления.
+func TestConnectionCallbacksKeepOrder(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	events := make(chan bool, 2)
+
+	client, errNew := New(testToken, func(context.Context, Message) {}, WithOnConnection(func(ok bool, _ string) {
+		if !ok {
+			close(started)
+			<-release
+		}
+
+		events <- ok
+	}))
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+
+	go client.markFailing("test")
+
+	<-started
+
+	go client.markHealthy()
+
+	select {
+	case <-events:
+		close(release)
+		t.Fatal("recovery overtook the loss notification")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(release)
+
+	if first, second := <-events, <-events; first || !second {
+		t.Errorf("events = %t, %t, want down then up", first, second)
+	}
+}
+
 // add — обработчик WithOnConnection.
 func (l *connectionLog) add(ok bool, reason string) {
 	l.mu.Lock()

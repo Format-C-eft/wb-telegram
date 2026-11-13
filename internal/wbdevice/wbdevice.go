@@ -1,3 +1,4 @@
+// Package wbdevice публикует устройство в MQTT по Wiren Board MQTT Conventions.
 package wbdevice
 
 import (
@@ -47,11 +48,11 @@ type Device struct {
 	firstReady     chan struct{}
 	firstReadyOnce sync.Once
 
-	// mu защищает values/errors и упорядочивает публикацию состояния контролов,
+	// controlLock защищает values/errors и упорядочивает публикацию состояния контролов,
 	// чтобы переподключение не затёрло более свежее значение из SetValue/SetError.
-	mu     sync.Mutex
-	values map[string]string
-	errors map[string]string
+	controlLock chan struct{}
+	values      map[string]string
+	errors      map[string]string
 
 	writes   chan write
 	stop     chan struct{}
@@ -84,13 +85,14 @@ func New(deviceID string, opts ...Option) (*Device, error) {
 	}
 
 	d := &Device{
-		id:       deviceID,
-		options:  o,
-		controls: map[string]Control{},
-		values:   map[string]string{},
-		errors:   map[string]string{},
-		writes:   make(chan write, writeQueueSize),
-		stop:     make(chan struct{}),
+		id:          deviceID,
+		options:     o,
+		controls:    map[string]Control{},
+		values:      map[string]string{},
+		errors:      map[string]string{},
+		writes:      make(chan write, writeQueueSize),
+		stop:        make(chan struct{}),
+		controlLock: make(chan struct{}, 1),
 
 		firstReady: make(chan struct{}),
 	}
@@ -107,6 +109,7 @@ func New(deviceID string, opts ...Option) (*Device, error) {
 		SetCleanSession(true).
 		SetAutoReconnect(true).
 		SetConnectRetry(true).
+		SetWriteTimeout(min(o.timeout, time.Second)).
 		SetStore(discardStore{}).
 		SetWill(deviceErrorTopic(deviceID), ErrorFlagRead, 1, true).
 		SetOnConnectHandler(d.onConnect).
@@ -189,10 +192,7 @@ func (d *Device) onConnect(_ paho.Client) {
 		delay = min(delay*2, setupRetryMax)
 	}
 
-	if d.markReady(generation) {
-		slog.Info("MQTT: устройство опубликовано", "device", d.id)
-		d.options.onConnected(true)
-	}
+	d.markReady(generation)
 }
 
 // setup публикует состояние устройства, один раз за процесс убирает контролы удалённых команд,
@@ -241,17 +241,22 @@ func (d *Device) publishHealthy(generation uint64) error {
 	return waitPublished(token, deviceErrorTopic(d.id), d.options.timeout)
 }
 
-// onConnectionLost снимает признак готовности; переподключение paho выполняет сам.
+// onConnectionLost записывает причину потери связи.
 func (d *Device) onConnectionLost(_ paho.Client, err error) {
-	d.nextGeneration()
-
 	slog.Warn("MQTT: соединение потеряно, переподключаюсь", "err", err)
-	d.options.onConnected(false)
 }
 
 // onReconnecting снимает признак готовности перед каждой попыткой переподключения.
 func (d *Device) onReconnecting(_ paho.Client, _ *paho.ClientOptions) {
-	d.nextGeneration()
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+
+	d.generation++
+	d.ready.Store(false)
+
+	if !d.isStopped() {
+		d.options.onConnected(false)
+	}
 }
 
 // nextGeneration начинает новое поколение соединения, снимает ready и возвращает номер поколения.
@@ -270,22 +275,23 @@ func (d *Device) isCurrent(generation uint64) bool {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
 
-	return d.generation == generation
+	return d.generation == generation && !d.isStopped()
 }
 
 // markReady выставляет ready, если поколение generation всё ещё текущее.
-func (d *Device) markReady(generation uint64) bool {
+func (d *Device) markReady(generation uint64) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
 
-	if d.generation != generation {
-		return false
+	if d.generation != generation || d.isStopped() || !d.client.IsConnectionOpen() {
+		return
 	}
 
 	d.ready.Store(true)
 	d.firstReadyOnce.Do(func() { close(d.firstReady) })
 
-	return true
+	slog.Info("MQTT: устройство опубликовано", "device", d.id)
+	d.options.onConnected(true)
 }
 
 // publishState публикует meta устройства, meta, значения и ошибки контролов; ошибку устройства
@@ -320,8 +326,12 @@ func (d *Device) publishControl(control Control) error {
 		return &Error{kind: kindInvalidArgument, Op: "encode control meta", Message: errMarshal.Error()}
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	errLock := d.lockControls(context.Background())
+	if errLock != nil {
+		return errLock
+	}
+
+	defer d.unlockControls()
 
 	if control.Volatile {
 		d.values[control.ID] = control.Initial
@@ -352,21 +362,45 @@ func (d *Device) subscribeWrites() error {
 		topic := controlOnTopic(d.id, control.ID)
 
 		token := d.client.Subscribe(topic, 1, d.handleWrite)
-		if !token.WaitTimeout(d.options.timeout) {
-			return &Error{kind: kindTimeout, Op: "subscribe", Topic: topic, Message: "no answer from broker"}
-		}
 
-		if token.Error() != nil {
-			return &Error{kind: kindMQTT, Op: "subscribe", Topic: topic, Message: token.Error().Error()}
+		errSubscribe := waitSubscribed(token, topic, d.options.timeout)
+		if errSubscribe != nil {
+			return errSubscribe
 		}
 	}
 
 	return nil
 }
 
-// handleWrite ставит запись в /on в очередь обработчика, не блокируя маршрутизатор paho
-// (иначе обработчик, вызывающий SetValue, ждал бы PUBACK, который некому принять).
+// waitSubscribed проверяет подтверждение подписки от брокера.
+func waitSubscribed(token paho.Token, topic string, timeout time.Duration) error {
+	if !token.WaitTimeout(timeout) {
+		return &Error{kind: kindTimeout, Op: "subscribe", Topic: topic, Message: "no answer from broker"}
+	}
+
+	if errSubscribe := token.Error(); errSubscribe != nil {
+		return &Error{kind: kindMQTT, Op: "subscribe", Topic: topic, Message: errSubscribe.Error()}
+	}
+
+	subscription, ok := token.(*paho.SubscribeToken)
+	if !ok {
+		return &Error{kind: kindMQTT, Op: "subscribe", Topic: topic, Message: "unexpected subscription token"}
+	}
+
+	qos, granted := subscription.Result()[topic]
+	if !granted || qos > 2 {
+		return &Error{kind: kindMQTT, Op: "subscribe", Topic: topic, Message: "broker denied subscription"}
+	}
+
+	return nil
+}
+
+// handleWrite принимает свежую запись в /on без ожидания места в очереди.
 func (d *Device) handleWrite(_ paho.Client, message paho.Message) {
+	if message.Retained() || d.isStopped() {
+		return
+	}
+
 	controlID, ok := controlIDFromTopic(d.id, message.Topic())
 	if !ok || d.options.onWrite == nil {
 		return
@@ -376,7 +410,8 @@ func (d *Device) handleWrite(_ paho.Client, message paho.Message) {
 
 	select {
 	case d.writes <- item:
-	case <-d.stop:
+	default:
+		slog.Warn("MQTT: очередь записей заполнена, новая запись пропущена", "control", controlID)
 	}
 }
 
@@ -394,20 +429,22 @@ func (d *Device) dispatchWrites() {
 	}
 }
 
-// SetValue публикует новое значение контрола (retained) и запоминает его для переподключений.
-// Если опубликовать не удалось, значение сбрасывается в "", чтобы команда, о неудаче
-// которой уже сообщили, не выполнилась позже при переподключении.
-func (d *Device) SetValue(controlID, value string) error {
+// SetValue публикует значение контрола и обновляет локальное состояние для переподключений.
+func (d *Device) SetValue(ctx context.Context, controlID, value string) error {
 	if _, ok := d.controls[controlID]; !ok {
 		return &Error{kind: kindUnknownControl, Op: "set value", Message: controlID}
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	errLock := d.lockControls(ctx)
+	if errLock != nil {
+		return errLock
+	}
+
+	defer d.unlockControls()
 
 	d.values[controlID] = value
 
-	errPublish := d.publish(controlTopic(d.id, controlID), value)
+	errPublish := d.publishControlValue(ctx, controlTopic(d.id, controlID), value)
 	if errPublish != nil {
 		d.values[controlID] = d.controls[controlID].Initial
 	}
@@ -416,17 +453,81 @@ func (d *Device) SetValue(controlID, value string) error {
 }
 
 // SetError публикует флаги ошибки контрола ("" — ошибки нет).
-func (d *Device) SetError(controlID, flags string) error {
+func (d *Device) SetError(ctx context.Context, controlID, flags string) error {
 	if _, ok := d.controls[controlID]; !ok {
 		return &Error{kind: kindUnknownControl, Op: "set error", Message: controlID}
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	errLock := d.lockControls(ctx)
+	if errLock != nil {
+		return errLock
+	}
+
+	defer d.unlockControls()
 
 	d.errors[controlID] = flags
 
-	return d.publish(controlErrorTopic(d.id, controlID), flags)
+	return d.publishControlValue(ctx, controlErrorTopic(d.id, controlID), flags)
+}
+
+// lockControls резервирует публикацию состояния контрола.
+func (d *Device) lockControls(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-d.stop:
+		return ErrNotConnected
+	case d.controlLock <- struct{}{}:
+	}
+
+	if errCtx := ctx.Err(); errCtx != nil {
+		d.unlockControls()
+
+		return errCtx
+	}
+
+	if d.isStopped() {
+		d.unlockControls()
+
+		return ErrNotConnected
+	}
+
+	return nil
+}
+
+// unlockControls освобождает публикацию состояния контрола.
+func (d *Device) unlockControls() {
+	<-d.controlLock
+}
+
+// publishControlValue публикует состояние контрола с отменой ожидания PUBACK.
+func (d *Device) publishControlValue(ctx context.Context, topic, value string) error {
+	if errCtx := ctx.Err(); errCtx != nil {
+		return errCtx
+	}
+
+	token, errEnqueue := d.enqueue(topic, value)
+	if errEnqueue != nil {
+		return errEnqueue
+	}
+
+	timer := time.NewTimer(d.options.timeout)
+	defer timer.Stop()
+
+	select {
+	case <-token.Done():
+		return publishResult(token, topic)
+	case <-timer.C:
+	case <-ctx.Done():
+	case <-d.stop:
+	}
+
+	select {
+	case <-token.Done():
+		return publishResult(token, topic)
+	default:
+		return &Error{kind: kindTimeout, Op: "publish", Topic: topic, Message: "publication not confirmed"}
+	}
 }
 
 // isStopped сообщает, что устройство останавливается.
@@ -512,9 +613,72 @@ func waitPublished(token paho.Token, topic string, timeout time.Duration) error 
 		return &Error{kind: kindTimeout, Op: "publish", Topic: topic, Message: "no answer from broker"}
 	}
 
-	if token.Error() != nil {
-		return &Error{kind: kindMQTT, Op: "publish", Topic: topic, Message: token.Error().Error()}
+	return publishResult(token, topic)
+}
+
+// publishResult возвращает результат завершённого токена публикации.
+func publishResult(token paho.Token, topic string) error {
+	if errPublish := token.Error(); errPublish != nil {
+		return &Error{kind: kindMQTT, Op: "publish", Topic: topic, Message: errPublish.Error()}
 	}
 
 	return nil
 }
+
+// errorKind классифицирует ошибки пакета wbdevice.
+type errorKind int
+
+const (
+	kindUnknown errorKind = iota
+	kindNotConnected
+	kindUnknownControl
+	kindInvalidArgument
+	kindTimeout
+	kindMQTT
+)
+
+// Error — ошибка пакета wbdevice.
+type Error struct {
+	kind    errorKind
+	Op      string
+	Topic   string
+	Message string
+}
+
+// Error возвращает текст ошибки.
+func (e *Error) Error() string {
+	text := "wbdevice"
+
+	if e.Op != "" {
+		text += ": " + e.Op
+	}
+
+	if e.Topic != "" {
+		text += " " + e.Topic
+	}
+
+	return text + ": " + e.Message
+}
+
+// Is сравнивает ошибки по виду.
+func (e *Error) Is(target error) bool {
+	t, ok := target.(*Error)
+	if !ok {
+		return false
+	}
+
+	return e.kind == t.kind
+}
+
+var (
+	// ErrNotConnected сообщает, что соединения с брокером нет.
+	ErrNotConnected = &Error{kind: kindNotConnected, Message: "not connected"}
+	// ErrUnknownControl сообщает об обращении к незарегистрированному контролу.
+	ErrUnknownControl = &Error{kind: kindUnknownControl, Message: "unknown control"}
+	// ErrInvalidArgument сообщает о некорректном идентификаторе или опции.
+	ErrInvalidArgument = &Error{kind: kindInvalidArgument, Message: "invalid argument"}
+	// ErrTimeout сообщает, что брокер не подтвердил начатую операцию.
+	ErrTimeout = &Error{kind: kindTimeout, Message: "timeout"}
+	// ErrMQTT сообщает об ошибке операции MQTT.
+	ErrMQTT = &Error{kind: kindMQTT, Message: "mqtt error"}
+)
