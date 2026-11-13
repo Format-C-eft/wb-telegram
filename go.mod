@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
-	github.com/go-telegram/bot v1.27.0
+	github.com/go-telegram/bot v1.28.0
 	github.com/mochi-mqtt/server/v2 v2.7.9
 	go.uber.org/mock v0.6.0
 )
