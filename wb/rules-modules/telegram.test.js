@@ -230,7 +230,11 @@ test('example includes callback-driven command pattern', () => {
 test('boiler widget redraws current chat data and keeps readings when data is invalid', () => {
   const htmlPath = path.join(__dirname, '../../internal/bot/boiler_widget.html');
   const html = fs.readFileSync(htmlPath, 'utf8');
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const openTag = '<script>\n';
+  const start = html.indexOf(openTag);
+  const end = html.indexOf('\n</script>', start + openTag.length);
+  assert.ok(start >= 0 && end > start, 'widget template must contain its script block');
+  const script = html.slice(start + openTag.length, end);
   const elements = Object.fromEntries(['temperature', 'status', 'updated', 'error', 'refresh'].map((id) => [id, {
     textContent: '',
     hidden: id === 'error',
