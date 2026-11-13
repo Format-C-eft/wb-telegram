@@ -29,9 +29,19 @@ type pendingCall struct {
 	chatID          int64
 	command         string
 	createdAt       time.Time
+	replyDeadline   time.Time
+	source          commandSource
+	ephemeralUsed   bool
 	answered        bool
+	answeredAt      time.Time
 	timeoutNotified bool
 	stopTimer       func() bool
+}
+
+// commandSource хранит адрес краткоживущего ответа Telegram.
+type commandSource struct {
+	callbackID string
+	widget     *telegram.WidgetQuery
 }
 
 // stop останавливает таймер ожидания ответа, если он запущен.
@@ -62,11 +72,19 @@ type Bot struct {
 	chartWorkers    sync.WaitGroup
 	chartBusy       map[int64]bool
 	chartSeen       map[string]chartSeenEntry
+	shortReplies    []shortReply
+	shortWorkers    int
+	shortActive     map[widgetMessage]bool
+	callbackActive  map[string]bool
+	commandJobs     []commandJob
+	commandDone     chan struct{}
 
-	// deliveryMu упорядочивает смену и публикацию флага ошибки доставки контрола send.
+	// deliveryMu защищает флаг доставки и его фоновую публикацию.
 	deliveryMu      sync.Mutex
 	deliveryFailing bool
+	deliveryDone    chan struct{}
 
+	telegramReportMu sync.Mutex
 	// statsMu защищает stats; берётся после mu, никогда наоборот.
 	statsMu sync.Mutex
 	stats   serviceStats
@@ -104,6 +122,7 @@ func New(cfg *config.Config, publisher Publisher, sender Sender, opts ...Option)
 		operationCtx: operationCtx, operationCancel: operationCancel, stopDone: make(chan struct{}),
 		panels: make(map[string]*buttonPanel), buttons: make(map[string]buttonAction),
 		chartJobs: make(chan chartJob, 8), chartBusy: make(map[int64]bool), chartSeen: make(map[string]chartSeenEntry),
+		shortActive: make(map[widgetMessage]bool), callbackActive: make(map[string]bool),
 	}, nil
 }
 
@@ -160,6 +179,8 @@ func (b *Bot) Stop() error {
 	}
 
 	b.stopped = true
+	b.shortReplies = nil
+	b.commandJobs = nil
 	cancel := b.cancel
 	b.operationCancel()
 
@@ -167,12 +188,6 @@ func (b *Bot) Stop() error {
 		call.stop()
 	}
 	b.mu.Unlock()
-
-	b.statsMu.Lock()
-	if b.stats.telegramStopTimer != nil {
-		b.stats.telegramStopTimer()
-	}
-	b.statsMu.Unlock()
 
 	if cancel != nil {
 		cancel()
@@ -182,7 +197,16 @@ func (b *Bot) Stop() error {
 	b.operations.Wait()
 	b.chartWorkers.Wait()
 
+	b.statsMu.Lock()
+
+	if b.stats.telegramStopTimer != nil {
+		b.stats.telegramStopTimer()
+	}
+
+	b.statsMu.Unlock()
+
 	b.mu.Lock()
+	clear(b.pending)
 	clear(b.panels)
 	clear(b.buttons)
 	clear(b.chartBusy)
@@ -211,7 +235,7 @@ func (b *Bot) beginOperation() bool {
 func (b *Bot) syncUserCommands(ctx context.Context, user config.User) {
 	commands := toTelegramCommands(b.cfg.CommandsFor(user.Name))
 
-	if statusAllowed(user) {
+	if statusAllowed(user) && len(commands) < config.MaxCommands {
 		commands = append(commands, telegram.Command{Name: statusCommand, Description: statusDescription})
 	}
 

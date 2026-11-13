@@ -25,7 +25,7 @@ func TestFormattedReply(t *testing.T) {
 
 		return nil
 	})
-	deps.publisher.EXPECT().SetValue("send", "  <b>Котёл</b>  ").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "  <b>Котёл</b>  ").Return(nil)
 	b.HandleSend([]byte(`{"text":"  <b>Котёл</b>  ","parse_mode":"HTML"}`))
 }
 
@@ -42,13 +42,13 @@ func TestButtonPanelConsumesOnce(t *testing.T) {
 
 		return nil
 	})
-	deps.publisher.EXPECT().SetValue("send", "Открыть?").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Открыть?").Return(nil)
 	b.HandleSend([]byte(`{"text":"Открыть?","buttons":[[{"text":"Да","command":"gate","args":"open"},{"text":"Нет","cancel":true}]]}`))
 
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), "q", "Принято", false).Return(nil)
 	deps.sender.EXPECT().ClearKeyboard(gomock.Any(), int64(100), 7).Return(nil)
 	deps.publisher.EXPECT().Connected().Return(true)
-	deps.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).DoAndReturn(func(_ string, raw string) error {
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).DoAndReturn(func(_ context.Context, _ string, raw string) error {
 		var call commandEvent
 
 		errJSON := json.Unmarshal([]byte(raw), &call)
@@ -65,9 +65,11 @@ func TestButtonPanelConsumesOnce(t *testing.T) {
 
 	cb := telegram.Callback{UpdateID: 20, QueryID: "q", FromID: 100, ChatID: 100, ChatType: "private", MessageID: 7, Data: data, Accessible: true}
 	b.HandleCallback(context.Background(), cb)
+	waitForWorkers(t, b)
 
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), "q", "Кнопка больше не действует", false).Return(nil)
 	b.HandleCallback(context.Background(), cb)
+	waitForWorkers(t, b)
 }
 
 // TestCallbackRejectsForeignUser не разрешает чужому пользователю потребить панель.
@@ -83,13 +85,15 @@ func TestCallbackRejectsForeignUser(t *testing.T) {
 
 		return nil
 	})
-	deps.publisher.EXPECT().SetValue("send", "Отмена?").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Отмена?").Return(nil)
 	b.HandleSend([]byte(`{"text":"Отмена?","buttons":[[{"text":"Нет","cancel":true}]]}`))
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), "q", "Кнопка недоступна", false).Return(nil)
 	b.HandleCallback(context.Background(), telegram.Callback{QueryID: "q", FromID: 200, ChatID: 100, ChatType: "private", MessageID: 7, Data: data, Accessible: true})
+	waitForWorkers(t, b)
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), "q", "Отменено", false).Return(nil)
 	deps.sender.EXPECT().ClearKeyboard(gomock.Any(), int64(100), 7).Return(nil)
 	b.HandleCallback(context.Background(), telegram.Callback{QueryID: "q", FromID: 100, ChatID: 100, ChatType: "private", MessageID: 7, Data: data, Accessible: true})
+	waitForWorkers(t, b)
 }
 
 // TestPanelExpiryAndClosedQueue очищает просроченные и недоставленные панели.
@@ -98,7 +102,7 @@ func TestPanelExpiryAndClosedQueue(t *testing.T) {
 
 	b, deps := newTestBot(t)
 	deps.sender.EXPECT().SendDelivery(int64(100), gomock.Any()).Return(telegram.ErrClosed)
-	deps.publisher.EXPECT().SetValue("send", "Выбор").Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "Выбор").Return(nil)
 	b.HandleSend([]byte(`{"text":"Выбор","buttons":[[{"text":"Нет","cancel":true}]]}`))
 
 	if len(b.panels) != 0 {
@@ -114,6 +118,7 @@ func TestPanelExpiryAndClosedQueue(t *testing.T) {
 
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), "q", "Кнопка больше не действует", false).Return(nil)
 	b.HandleCallback(context.Background(), telegram.Callback{QueryID: "q", FromID: 100, ChatID: 100, ChatType: "private", Data: panel.keyboard[0][0].Data, Accessible: true})
+	waitForWorkers(t, b)
 }
 
 // TestConcurrentCallbacks публикует только один вызов при одновременном нажатии.
@@ -130,7 +135,7 @@ func TestConcurrentCallbacks(t *testing.T) {
 	deps.sender.EXPECT().AnswerCallback(gomock.Any(), gomock.Any(), gomock.Any(), false).Return(nil).Times(2)
 	deps.sender.EXPECT().ClearKeyboard(gomock.Any(), int64(100), 7).Return(nil)
 	deps.publisher.EXPECT().Connected().Return(true)
-	deps.publisher.EXPECT().SetValue("cmd_gate", gomock.Any()).Return(nil)
+	deps.publisher.EXPECT().SetValue(gomock.Any(), "cmd_gate", gomock.Any()).Return(nil)
 
 	var workers sync.WaitGroup
 	workers.Add(2)
@@ -144,6 +149,7 @@ func TestConcurrentCallbacks(t *testing.T) {
 	}
 
 	workers.Wait()
+	waitForWorkers(t, b)
 }
 
 // TestInvalidInteractionPayload не принимает противоречивые сообщения.

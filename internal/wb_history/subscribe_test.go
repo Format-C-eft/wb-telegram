@@ -2,6 +2,7 @@ package wb_history
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,6 +10,34 @@ import (
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
 )
+
+// TestBrokerAddressAliases проверяет адреса MQTT с tcp и без явной схемы.
+func TestBrokerAddressAliases(t *testing.T) {
+	t.Parallel()
+
+	_, broker := localBrokerServer(t)
+	address := strings.TrimPrefix(broker, "tcp://")
+
+	for _, prefix := range []string{"", "mqtt://"} {
+		t.Run(prefix+address, func(t *testing.T) {
+			t.Parallel()
+
+			client, errNew := New(WithBroker(prefix + address))
+			if errNew != nil {
+				t.Fatal(errNew)
+			}
+
+			t.Cleanup(func() { _ = client.Stop() })
+
+			errRun := client.Run(t.Context())
+			if errRun != nil {
+				t.Fatal(errRun)
+			}
+
+			awaitReady(t, client)
+		})
+	}
+}
 
 // subscribeFault отказывает в первом SUBACK без потери соединения.
 type subscribeFault struct {
@@ -117,7 +146,7 @@ func TestSubscribeRetryGeneration(t *testing.T) {
 	t.Parallel()
 
 	client, fault := retryClient(t, true)
-	client.onLost(nil, nil)
+	client.onReconnecting(nil, nil)
 
 	done := make(chan struct{})
 

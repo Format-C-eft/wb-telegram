@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -125,4 +126,45 @@ func newTestBot(t *testing.T, opts ...Option) (*Bot, testDeps) {
 	}
 
 	return b, deps
+}
+
+// waitForCommandWorker ждёт завершения очереди команд.
+func waitForCommandWorker(t *testing.T, b *Bot) {
+	t.Helper()
+
+	b.mu.Lock()
+	done := b.commandDone
+	b.mu.Unlock()
+
+	if done != nil {
+		awaitSignal(t, done)
+	}
+}
+
+// waitForShortWorkers ждёт завершения очереди коротких ответов.
+func waitForShortWorkers(t *testing.T, b *Bot) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		b.mu.Lock()
+		idle := b.shortWorkers == 0
+		b.mu.Unlock()
+
+		if idle {
+			return
+		}
+
+		runtime.Gosched()
+	}
+
+	t.Fatal("short reply workers did not become idle")
+}
+
+// waitForWorkers ждёт завершения очередей команд и коротких ответов.
+func waitForWorkers(t *testing.T, b *Bot) {
+	t.Helper()
+
+	waitForCommandWorker(t, b)
+	waitForShortWorkers(t, b)
 }

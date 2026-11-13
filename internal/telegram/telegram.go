@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -52,8 +53,9 @@ type Client struct {
 	queue   *queue
 	limiter *limiter
 
-	failing atomic.Bool
-	fatal   atomic.Bool
+	failing  atomic.Bool
+	fatal    atomic.Bool
+	username atomic.Pointer[string]
 
 	// failMu защищает failSince и failErrors; берётся при смене состояния failing.
 	failMu     sync.Mutex
@@ -109,11 +111,17 @@ func New(token string, handler Handler, opts ...Option) (*Client, error) {
 		webhookDone: make(chan struct{}),
 	}
 
+	updates := bot.AllowedUpdates{models.AllowedUpdateMessage, models.AllowedUpdateCallbackQuery}
+	if o.onWidgetQuery != nil {
+		updates = append(updates, models.AllowedUpdateWidgetQuery)
+	}
+
 	api, errNew := bot.New(token,
 		bot.WithSkipGetMe(),
 		bot.WithServerURL(o.serverURL),
 		bot.WithHTTPClient(o.pollTimeout, &healthClient{inner: newHTTPClient(o.connectTimeout, o.pollTimeout), alive: c.markHealthy}),
-		bot.WithAllowedUpdates(bot.AllowedUpdates{"message", "callback_query"}),
+		bot.WithAllowedUpdates(updates),
+		bot.WithNotAsyncHandlers(),
 		bot.WithDefaultHandler(c.dispatch(handler)),
 		bot.WithErrorsHandler(c.onPollError),
 	)
@@ -283,6 +291,15 @@ func (c *Client) dispatch(handler Handler) bot.HandlerFunc {
 	return func(ctx context.Context, _ *bot.Bot, update *models.Update) {
 		c.markHealthy()
 
+		if update.WidgetQuery != nil && c.options.onWidgetQuery != nil {
+			query, ok := widgetQueryFromUpdate(update)
+			if ok {
+				c.options.onWidgetQuery(ctx, query)
+			}
+
+			return
+		}
+
 		if update.CallbackQuery != nil {
 			if c.options.onCallback != nil {
 				c.options.onCallback(ctx, callbackFromUpdate(update))
@@ -295,6 +312,10 @@ func (c *Client) dispatch(handler Handler) bot.HandlerFunc {
 			return
 		}
 
+		if !c.addressedToBot(ctx, update.Message) {
+			return
+		}
+
 		handler(ctx, Message{
 			UpdateID: update.ID,
 			ChatID:   update.Message.Chat.ID,
@@ -302,6 +323,52 @@ func (c *Client) dispatch(handler Handler) bot.HandlerFunc {
 			Date:     time.Unix(int64(update.Message.Date), 0),
 		})
 	}
+}
+
+// addressedToBot проверяет адресата команды в общем чате.
+func (c *Client) addressedToBot(ctx context.Context, msg *models.Message) bool {
+	if msg.Chat.Type == models.ChatTypePrivate {
+		return true
+	}
+
+	head := strings.TrimSpace(msg.Text)
+	if !strings.HasPrefix(head, "/") {
+		return true
+	}
+
+	if end := strings.IndexFunc(head, unicode.IsSpace); end >= 0 {
+		head = head[:end]
+	}
+
+	_, username, mentioned := strings.Cut(head, "@")
+	if !mentioned {
+		return true
+	}
+
+	return username != "" && strings.EqualFold(username, c.botUsername(ctx))
+}
+
+// botUsername возвращает имя бота для проверки адресованных команд.
+func (c *Client) botUsername(ctx context.Context) string {
+	cached := c.username.Load()
+	if cached != nil {
+		return *cached
+	}
+
+	requestCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	me, errGet := c.api.GetMe(requestCtx)
+	if errGet != nil {
+		errLookup := c.fail("get bot username", errGet)
+		slog.Debug("Telegram: не удалось определить имя бота", "err", errLookup)
+
+		return ""
+	}
+
+	c.username.Store(&me.Username)
+
+	return me.Username
 }
 
 // onPollError обрабатывает ошибки polling и состояние связи.
@@ -383,6 +450,7 @@ func (c *Client) reportFatal(err *Error) {
 // markFailing пишет в журнал только первую ошибку связи подряд.
 func (c *Client) markFailing(message string) {
 	c.failMu.Lock()
+	defer c.failMu.Unlock()
 
 	c.failErrors++
 
@@ -390,8 +458,6 @@ func (c *Client) markFailing(message string) {
 	if first {
 		c.failSince = time.Now()
 	}
-
-	c.failMu.Unlock()
 
 	if first {
 		slog.Warn("Telegram: ошибка связи, повторяю в фоне", "err", message)
@@ -405,24 +471,15 @@ func (c *Client) markFailing(message string) {
 
 // markHealthy пишет в журнал восстановление связи после серии ошибок: сколько длилась и сколько ошибок подряд.
 func (c *Client) markHealthy() {
-	if !c.failing.Load() {
-		return
-	}
-
 	c.failMu.Lock()
+	defer c.failMu.Unlock()
 
-	recovered := c.failing.CompareAndSwap(true, false)
-	since := c.failSince
-	errorsInRow := c.failErrors
-	c.failErrors = 0
-
-	c.failMu.Unlock()
-
-	if !recovered {
+	if !c.failing.Swap(false) {
 		return
 	}
 
-	slog.Info("Telegram: связь восстановлена", "после", time.Since(since).Round(time.Millisecond), "ошибок", errorsInRow)
+	slog.Info("Telegram: связь восстановлена", "после", time.Since(c.failSince).Round(time.Millisecond), "ошибок", c.failErrors)
+	c.failErrors = 0
 	c.options.onConnection(true, "")
 }
 

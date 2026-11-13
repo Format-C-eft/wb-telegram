@@ -61,6 +61,9 @@ func (b *Bot) ReportTelegram(ok bool, reason string) {
 	}
 	defer b.operations.Done()
 
+	b.telegramReportMu.Lock()
+	defer b.telegramReportMu.Unlock()
+
 	now := b.options.now()
 
 	b.statsMu.Lock()
@@ -112,6 +115,15 @@ func (b *Bot) ReportTelegram(ok bool, reason string) {
 // announceTelegramLoss создаёт обработчик уведомления о длительном обрыве.
 func (b *Bot) announceTelegramLoss(since time.Time) func() {
 	return func() {
+		if !b.beginOperation() {
+			return
+		}
+
+		defer b.operations.Done()
+
+		b.telegramReportMu.Lock()
+		defer b.telegramReportMu.Unlock()
+
 		b.statsMu.Lock()
 
 		if b.stats.telegramDownSince.IsZero() || !b.stats.telegramDownSince.Equal(since) {
@@ -185,10 +197,21 @@ func (b *Bot) countStale() {
 
 // countCall учитывает опубликованный вызов и запоминает его как последний.
 func (b *Bot) countCall(id, command, user string, at time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	last := &lastCallInfo{id: id, command: command, user: user, at: at}
+
+	call := b.pending[id]
+	if call != nil && call.answered {
+		last.replied = true
+		last.latency = call.answeredAt.Sub(at)
+	}
+
 	b.statsMu.Lock()
 
 	b.stats.calls++
-	b.stats.lastCall = &lastCallInfo{id: id, command: command, user: user, at: at}
+	b.stats.lastCall = last
 
 	b.statsMu.Unlock()
 }
@@ -201,15 +224,13 @@ func (b *Bot) countUnanswered() {
 }
 
 // countReply запоминает время первого ответа правила на последний вызов.
-func (b *Bot) countReply(id string) {
-	now := b.options.now()
-
+func (b *Bot) countReply(id string, at time.Time) {
 	b.statsMu.Lock()
 
 	last := b.stats.lastCall
 	if last != nil && last.id == id && !last.replied {
 		last.replied = true
-		last.latency = now.Sub(last.at)
+		last.latency = at.Sub(last.at)
 	}
 
 	b.statsMu.Unlock()

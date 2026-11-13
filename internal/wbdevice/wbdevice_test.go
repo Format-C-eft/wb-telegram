@@ -152,12 +152,12 @@ func TestDeviceSetValueAndError(t *testing.T) {
 
 	waitForRetained(t, obs, "/devices/telegram_bot/meta")
 
-	errValue := dev.SetValue("cmd_gate", `{"id":"1"}`)
+	errValue := dev.SetValue(t.Context(), "cmd_gate", `{"id":"1"}`)
 	if errValue != nil {
 		t.Fatalf("SetValue: %v", errValue)
 	}
 
-	errError := dev.SetError("send", ErrorFlagWrite)
+	errError := dev.SetError(t.Context(), "send", ErrorFlagWrite)
 	if errError != nil {
 		t.Fatalf("SetError: %v", errError)
 	}
@@ -169,7 +169,7 @@ func TestDeviceSetValueAndError(t *testing.T) {
 		return value == `{"id":"1"}` && flags == "w"
 	})
 
-	errUnknown := dev.SetValue("nope", "x")
+	errUnknown := dev.SetValue(t.Context(), "nope", "x")
 	if !errors.Is(errUnknown, ErrUnknownControl) {
 		t.Fatalf("SetValue(nope) = %v, want ErrUnknownControl", errUnknown)
 	}
@@ -187,12 +187,12 @@ func TestDeviceReconnect(t *testing.T) {
 
 	waitForRetained(t, obs, "/devices/telegram_bot/meta")
 
-	errValue := dev.SetValue("cmd_gate", `{"id":"7"}`)
+	errValue := dev.SetValue(t.Context(), "cmd_gate", `{"id":"7"}`)
 	if errValue != nil {
 		t.Fatalf("SetValue: %v", errValue)
 	}
 
-	errSend := dev.SetValue("send", "привет")
+	errSend := dev.SetValue(t.Context(), "send", "привет")
 	if errSend != nil {
 		t.Fatalf("SetValue send: %v", errSend)
 	}
@@ -263,7 +263,7 @@ func TestDeviceHandlerCanSetValue(t *testing.T) {
 	)
 
 	handler := func(controlID string, payload []byte) {
-		errSet := current.Load().SetValue(controlID, string(payload))
+		errSet := current.Load().SetValue(t.Context(), controlID, string(payload))
 		if errSet != nil {
 			failures.Add(1)
 		}
@@ -334,7 +334,7 @@ func TestDeviceSetValueFailureNotReplayed(t *testing.T) {
 
 	t.Cleanup(func() { _ = dev.Stop() })
 
-	errValue := dev.SetValue("cmd_gate", `{"id":"failed"}`)
+	errValue := dev.SetValue(t.Context(), "cmd_gate", `{"id":"failed"}`)
 	if !errors.Is(errValue, ErrNotConnected) {
 		t.Fatalf("SetValue before connect = %v, want ErrNotConnected", errValue)
 	}
@@ -604,7 +604,7 @@ func TestDeviceShutdownMarksError(t *testing.T) {
 		t.Fatal("device must be disconnected after Shutdown")
 	}
 
-	if errValue := dev.SetValue("send", "x"); !errors.Is(errValue, ErrNotConnected) {
+	if errValue := dev.SetValue(t.Context(), "send", "x"); !errors.Is(errValue, ErrNotConnected) {
 		t.Fatalf("SetValue after shutdown = %v, want ErrNotConnected", errValue)
 	}
 }

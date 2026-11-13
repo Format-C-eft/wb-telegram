@@ -114,12 +114,9 @@ func collectRetained(client paho.Client, filter string, window time.Duration, st
 		mu.Unlock()
 	})
 
-	if !token.WaitTimeout(purgeTimeout) {
-		return nil, &Error{kind: kindTimeout, Op: "subscribe", Topic: filter, Message: "no answer from broker"}
-	}
-
-	if token.Error() != nil {
-		return nil, &Error{kind: kindMQTT, Op: "subscribe", Topic: filter, Message: token.Error().Error()}
+	errSubscribe := waitSubscribed(token, filter, purgeTimeout)
+	if errSubscribe != nil {
+		return nil, errSubscribe
 	}
 
 	stopped := false

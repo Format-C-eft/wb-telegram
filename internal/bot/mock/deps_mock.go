@@ -14,10 +14,9 @@ import (
 	reflect "reflect"
 	time "time"
 
-	gomock "go.uber.org/mock/gomock"
-
 	chart "github.com/Format-C-eft/wb-telegram/internal/chart"
 	telegram "github.com/Format-C-eft/wb-telegram/internal/telegram"
+	gomock "go.uber.org/mock/gomock"
 )
 
 // MockPublisher is a mock of Publisher interface.
@@ -59,31 +58,31 @@ func (mr *MockPublisherMockRecorder) Connected() *gomock.Call {
 }
 
 // SetError mocks base method.
-func (m *MockPublisher) SetError(controlID, flags string) error {
+func (m *MockPublisher) SetError(ctx context.Context, controlID, flags string) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "SetError", controlID, flags)
+	ret := m.ctrl.Call(m, "SetError", ctx, controlID, flags)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // SetError indicates an expected call of SetError.
-func (mr *MockPublisherMockRecorder) SetError(controlID, flags any) *gomock.Call {
+func (mr *MockPublisherMockRecorder) SetError(ctx, controlID, flags any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetError", reflect.TypeOf((*MockPublisher)(nil).SetError), controlID, flags)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetError", reflect.TypeOf((*MockPublisher)(nil).SetError), ctx, controlID, flags)
 }
 
 // SetValue mocks base method.
-func (m *MockPublisher) SetValue(controlID, value string) error {
+func (m *MockPublisher) SetValue(ctx context.Context, controlID, value string) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "SetValue", controlID, value)
+	ret := m.ctrl.Call(m, "SetValue", ctx, controlID, value)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // SetValue indicates an expected call of SetValue.
-func (mr *MockPublisherMockRecorder) SetValue(controlID, value any) *gomock.Call {
+func (mr *MockPublisherMockRecorder) SetValue(ctx, controlID, value any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetValue", reflect.TypeOf((*MockPublisher)(nil).SetValue), controlID, value)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetValue", reflect.TypeOf((*MockPublisher)(nil).SetValue), ctx, controlID, value)
 }
 
 // MockSender is a mock of Sender interface.
@@ -124,6 +123,20 @@ func (mr *MockSenderMockRecorder) AnswerCallback(ctx, queryID, text, alert any) 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AnswerCallback", reflect.TypeOf((*MockSender)(nil).AnswerCallback), ctx, queryID, text, alert)
 }
 
+// AnswerWidgetQuery mocks base method.
+func (m *MockSender) AnswerWidgetQuery(ctx context.Context, queryID, data string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AnswerWidgetQuery", ctx, queryID, data)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// AnswerWidgetQuery indicates an expected call of AnswerWidgetQuery.
+func (mr *MockSenderMockRecorder) AnswerWidgetQuery(ctx, queryID, data any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AnswerWidgetQuery", reflect.TypeOf((*MockSender)(nil).AnswerWidgetQuery), ctx, queryID, data)
+}
+
 // ClearKeyboard mocks base method.
 func (m *MockSender) ClearKeyboard(ctx context.Context, chatID int64, messageID int) error {
 	m.ctrl.T.Helper()
@@ -136,6 +149,20 @@ func (m *MockSender) ClearKeyboard(ctx context.Context, chatID int64, messageID 
 func (mr *MockSenderMockRecorder) ClearKeyboard(ctx, chatID, messageID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ClearKeyboard", reflect.TypeOf((*MockSender)(nil).ClearKeyboard), ctx, chatID, messageID)
+}
+
+// EditWidgetData mocks base method.
+func (m *MockSender) EditWidgetData(ctx context.Context, query telegram.WidgetQuery, data string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "EditWidgetData", ctx, query, data)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// EditWidgetData indicates an expected call of EditWidgetData.
+func (mr *MockSenderMockRecorder) EditWidgetData(ctx, query, data any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EditWidgetData", reflect.TypeOf((*MockSender)(nil).EditWidgetData), ctx, query, data)
 }
 
 // Send mocks base method.
@@ -164,6 +191,20 @@ func (m *MockSender) SendDelivery(chatID int64, delivery telegram.Delivery) erro
 func (mr *MockSenderMockRecorder) SendDelivery(chatID, delivery any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SendDelivery", reflect.TypeOf((*MockSender)(nil).SendDelivery), chatID, delivery)
+}
+
+// SendEphemeral mocks base method.
+func (m *MockSender) SendEphemeral(ctx context.Context, queryID string, delivery telegram.Delivery) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SendEphemeral", ctx, queryID, delivery)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// SendEphemeral indicates an expected call of SendEphemeral.
+func (mr *MockSenderMockRecorder) SendEphemeral(ctx, queryID, delivery any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SendEphemeral", reflect.TypeOf((*MockSender)(nil).SendEphemeral), ctx, queryID, delivery)
 }
 
 // SetCommands mocks base method.

@@ -77,15 +77,34 @@ func truncate(text string) string {
 }
 
 // sendAttempt отправляет одну попытку с новым reader изображения.
-func (c *Client) sendAttempt(ctx context.Context, item outgoing) error {
+func (c *Client) sendAttempt(ctx context.Context, item outgoing, callbackID string) error {
 	d := item.delivery
-	if d.Kind == DeliveryPhoto {
-		_, errPhoto := c.api.SendPhoto(ctx, &bot.SendPhotoParams{ChatID: item.chatID, Photo: &models.InputFileUpload{Filename: "chart.png", Data: bytes.NewReader(d.PNG)}, Caption: d.Caption, ParseMode: models.ParseMode(d.ParseMode)})
+
+	var (
+		chatID    any = item.chatID
+		ephemeral *models.EphemeralMessageParameters
+	)
+
+	if callbackID != "" {
+		chatID = nil
+		ephemeral = &models.EphemeralMessageParameters{CallbackQueryID: callbackID}
+	}
+
+	switch d.Kind {
+	case DeliveryWidget:
+		_, errWidget := c.api.SendWidget(ctx, &bot.SendWidgetParams{ChatID: chatID, HTML: d.Widget.HTML, ChatData: d.Widget.Data, Caption: d.Caption, AllowQueries: true})
+
+		return errWidget
+	case DeliveryPhoto:
+		_, errPhoto := c.api.SendPhoto(ctx, &bot.SendPhotoParams{
+			ChatID: chatID, Photo: &models.InputFileUpload{Filename: "chart.png", Data: bytes.NewReader(d.PNG)},
+			Caption: d.Caption, ParseMode: models.ParseMode(d.ParseMode), EphemeralMessageParameters: ephemeral,
+		})
 
 		return errPhoto
 	}
 
-	params := &bot.SendMessageParams{ChatID: item.chatID, Text: item.text, ParseMode: models.ParseMode(d.ParseMode)}
+	params := &bot.SendMessageParams{ChatID: chatID, Text: item.text, ParseMode: models.ParseMode(d.ParseMode), EphemeralMessageParameters: ephemeral}
 	if len(d.Keyboard) > 0 {
 		rows := make([][]models.InlineKeyboardButton, len(d.Keyboard))
 		for index, row := range d.Keyboard {
@@ -133,7 +152,7 @@ func (c *Client) deliver(ctx context.Context, item outgoing) bool {
 			}
 		}
 
-		errSend := c.sendAttempt(ctx, item)
+		errSend := c.sendAttempt(ctx, item, "")
 		c.limiter.record(item.chatID)
 
 		if errSend == nil {

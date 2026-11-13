@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/Format-C-eft/wb-telegram/internal/telegram"
 )
@@ -27,63 +28,60 @@ func (b *Bot) HandleCallback(_ context.Context, callback telegram.Callback) {
 		return
 	}
 
-	action, status := b.consumeButton(callback, user.Name)
-	if status != "" {
-		b.answerCallback(callback, status)
-
-		return
-	}
-
-	if action.Cancel {
-		b.answerCallback(callback, "Отменено")
-		b.clearKeyboard(callback)
-
-		return
-	}
-
-	b.answerCallback(callback, "Принято")
-
-	if !b.publisher.Connected() {
+	now := b.options.now()
+	if b.acceptButton(callback, user.Name, now) {
 		b.deliver(callback.ChatID, unavailableText)
-		b.clearKeyboard(callback)
-
-		return
 	}
-
-	if b.operationCtx.Err() == nil {
-		now := b.options.now()
-		b.publishCall(telegram.Message{UpdateID: callback.UpdateID, ChatID: callback.ChatID, Date: now}, user.Name, action.Command, action.Args, now)
-	}
-
-	b.clearKeyboard(callback)
 }
 
-// consumeButton атомарно потребляет всю панель допустимого адресата.
-func (b *Bot) consumeButton(callback telegram.Callback, userName string) (buttonSpec, string) {
+// acceptButton обрабатывает выбор и сообщает, недоступен ли контроллер.
+func (b *Bot) acceptButton(callback telegram.Callback, userName string, now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.prunePanelsLocked(b.options.now())
+	b.prunePanelsLocked(now)
 
+	status, consumed, offline := b.applyButton(callback, userName, now)
+	if callback.QueryID != "" || consumed {
+		b.queueShortReplyLocked(b.callbackReply(callback, status, consumed, now))
+	}
+
+	return offline
+}
+
+// applyButton принимает выбор и обновляет панель под b.mu.
+func (b *Bot) applyButton(callback telegram.Callback, userName string, now time.Time) (status string, consumed, offline bool) {
 	action, found := b.buttons[callback.Data]
 	if !found || b.stopped {
-		return buttonSpec{}, "Кнопка больше не действует"
+		return "Кнопка больше не действует", false, false
 	}
 
 	if action.panel.chatID != callback.ChatID {
-		return buttonSpec{}, "Кнопка недоступна"
+		return "Кнопка недоступна", false, false
 	}
 
-	if !action.spec.Cancel {
-		command, known := b.cfg.Command(action.spec.Command)
-		if !known || !b.cfg.Allowed(command, userName) {
-			return buttonSpec{}, "Кнопка недоступна"
-		}
+	if action.spec.Cancel {
+		b.removePanelLocked(action.panel)
+
+		return "Отменено", true, false
+	}
+
+	command, known := b.cfg.Command(action.spec.Command)
+	if !known || !b.cfg.Allowed(command, userName) {
+		return "Кнопка недоступна", false, false
+	}
+
+	connected := b.publisher.Connected()
+	if connected && !b.queueCommandLocked(commandJob{
+		updateID: callback.UpdateID, chatID: callback.ChatID, user: userName, name: action.spec.Command, args: action.spec.Args,
+		received: now, source: commandSource{callbackID: callback.QueryID},
+	}) {
+		return commandBusyText, false, false
 	}
 
 	b.removePanelLocked(action.panel)
 
-	return action.spec, ""
+	return "Принято", true, !connected
 }
 
 // answerCallback отвечает на нажатие вне очереди сообщений.
@@ -92,19 +90,28 @@ func (b *Bot) answerCallback(callback telegram.Callback, text string) {
 		return
 	}
 
-	errAnswer := b.sender.AnswerCallback(b.operationCtx, callback.QueryID, text, false)
-	if errAnswer != nil {
-		slog.Debug("Telegram: ответ на нажатие не отправлен", "err", errAnswer)
-	}
+	b.queueShortReply(b.callbackReply(callback, text, false, b.options.now()))
+}
+
+// callbackReply создаёт подтверждение нажатия и снятие кнопок.
+func (b *Bot) callbackReply(callback telegram.Callback, text string, clear bool, received time.Time) shortReply {
+	return shortReply{deadline: received.Add(shortReplyWindow), callback: callback.QueryID, send: func(ctx context.Context) {
+		if callback.QueryID != "" {
+			errAnswer := b.sender.AnswerCallback(ctx, callback.QueryID, text, false)
+			if errAnswer != nil {
+				slog.Debug("Telegram: ответ на нажатие не отправлен", "err", errAnswer)
+			}
+		}
+
+		if clear && ctx.Err() == nil {
+			b.clearKeyboard(ctx, callback)
+		}
+	}}
 }
 
 // clearKeyboard снимает отработавшую клавиатуру без повторения действия.
-func (b *Bot) clearKeyboard(callback telegram.Callback) {
-	if b.operationCtx.Err() != nil {
-		return
-	}
-
-	errClear := b.sender.ClearKeyboard(b.operationCtx, callback.ChatID, callback.MessageID)
+func (b *Bot) clearKeyboard(ctx context.Context, callback telegram.Callback) {
+	errClear := b.sender.ClearKeyboard(ctx, callback.ChatID, callback.MessageID)
 	if errClear != nil {
 		slog.Debug("Telegram: клавиатура не снята", "err", errClear)
 	}

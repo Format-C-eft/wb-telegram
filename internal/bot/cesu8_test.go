@@ -3,6 +3,8 @@ package bot
 import (
 	"bytes"
 	"testing"
+
+	"go.uber.org/mock/gomock"
 )
 
 // cesuFire — эмодзи 🔥 (U+1F525) так, как его отдаёт wb-rules: суррогатная пара D83D DD25 в CESU-8.
@@ -59,7 +61,7 @@ func TestHandleSendFixesEmojiFromRules(t *testing.T) {
 			b, deps := newTestBot(t)
 
 			deps.sender.EXPECT().Send(int64(100), "🔥 Котёл").Return(nil)
-			deps.publisher.EXPECT().SetValue("send", "🔥 Котёл").Return(nil)
+			deps.publisher.EXPECT().SetValue(gomock.Any(), "send", "🔥 Котёл").Return(nil)
 
 			b.HandleSend(tt.payload)
 		})

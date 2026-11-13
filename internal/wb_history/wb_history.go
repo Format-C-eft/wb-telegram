@@ -143,7 +143,7 @@ func New(opts ...Option) (*Client, error) {
 
 	id := "wb-telegram-history-" + hex.EncodeToString(nonce[:])
 	c := &Client{options: o, topic: "/rpc/v1/db_logger/history/get_values/" + id, messages: make(chan incoming, 1), stop: make(chan struct{}), done: make(chan struct{})}
-	config := paho.NewClientOptions().AddBroker(o.broker).SetClientID(id).SetCleanSession(true).SetAutoReconnect(true).SetConnectRetry(true).SetConnectTimeout(time.Second).SetConnectRetryInterval(time.Second).SetMaxReconnectInterval(5 * time.Second).SetWriteTimeout(time.Second).SetResumeSubs(false).SetStore(discardStore{}).SetOnConnectHandler(c.onConnect).SetConnectionLostHandler(c.onLost)
+	config := paho.NewClientOptions().AddBroker(o.broker).SetClientID(id).SetCleanSession(true).SetAutoReconnect(true).SetConnectRetry(true).SetConnectTimeout(time.Second).SetConnectRetryInterval(time.Second).SetMaxReconnectInterval(5 * time.Second).SetWriteTimeout(time.Second).SetResumeSubs(false).SetStore(discardStore{}).SetOnConnectHandler(c.onConnect).SetReconnectingHandler(c.onReconnecting)
 	c.client = paho.NewClient(config)
 
 	return c, nil
@@ -208,7 +208,7 @@ func (c *Client) Ready() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.ready && !c.closed
+	return c.ready && !c.closed && c.client.IsConnectionOpen()
 }
 
 // onConnect оформляет подписку текущего соединения.
@@ -252,8 +252,8 @@ func (c *Client) onConnect(client paho.Client) {
 	}
 }
 
-// onLost сбрасывает готовность и активный запрос.
-func (c *Client) onLost(_ paho.Client, _ error) {
+// onReconnecting сбрасывает готовность и активный запрос.
+func (c *Client) onReconnecting(_ paho.Client, _ *paho.ClientOptions) {
 	c.mu.Lock()
 	c.generation++
 	c.ready = false
@@ -368,7 +368,12 @@ func (c *Client) subscribe(client paho.Client, generation uint64) bool {
 	}
 
 	subscription, ok := token.(*paho.SubscribeToken)
-	if !ok || subscription.Result()[c.topic+"/reply"] == 0x80 {
+	if !ok {
+		return false
+	}
+
+	qos, granted := subscription.Result()[c.topic+"/reply"]
+	if !granted || qos > 2 {
 		return false
 	}
 

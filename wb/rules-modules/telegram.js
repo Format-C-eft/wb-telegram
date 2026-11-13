@@ -159,6 +159,7 @@ exports.onCommand = function (name, handler) {
     then: function (newValue) {
       var call;
       var age;
+      var now;
 
       if (!newValue) {
         return;
@@ -171,12 +172,14 @@ exports.onCommand = function (name, handler) {
         return;
       }
 
-      if (!call || !call.id) {
+      if (!call || !call.id || typeof call.ts !== "number" || !isFinite(call.ts)) {
         return;
       }
 
-      age = Date.now() / 1000 - call.ts;
-      if (!(call.ts >= loadedAt - 1) || !(age <= MAX_AGE_S)) {
+      now = Date.now() / 1000;
+      loadedAt = Math.min(loadedAt, now);
+      age = now - call.ts;
+      if (call.ts < loadedAt - 1 || age > MAX_AGE_S || age < -1) {
         return;
       }
 
@@ -188,6 +191,7 @@ exports.onCommand = function (name, handler) {
         id: call.id,
         user: call.user,
         args: call.args || "",
+        canReplyEphemeral: call.can_reply_ephemeral === true,
         reply: function (text, options) {
           publish({ text: String(text) }, options, { reply_to: call.id });
         },
@@ -199,6 +203,30 @@ exports.onCommand = function (name, handler) {
         },
         replyChart: function (spec) {
           publish({ chart: spec }, null, { reply_to: call.id });
+        },
+        replyEphemeral: function (text) {
+          if (call.can_reply_ephemeral !== true) {
+            throw new Error("telegram: команда не поддерживает временный ответ");
+          }
+
+          publish({ text: String(text), ephemeral: true }, null, { reply_to: call.id });
+        },
+        replyEphemeralChart: function (spec) {
+          if (call.can_reply_ephemeral !== true) {
+            throw new Error("telegram: команда не поддерживает временный ответ");
+          }
+
+          publish({ chart: spec, ephemeral: true }, null, { reply_to: call.id });
+        },
+        replyBoilerWidget: function (spec) {
+          if (name !== "boiler_status") {
+            throw new Error("telegram: карточка котла доступна только для boiler_status");
+          }
+
+          publish({ boiler_widget: {
+            temperature: String(spec.temperature),
+            status: String(spec.status)
+          } }, null, { reply_to: call.id });
         }
       });
     }

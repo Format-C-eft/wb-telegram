@@ -6,8 +6,9 @@ import "unicode/utf16"
 type DeliveryKind string
 
 const (
-	DeliveryText  DeliveryKind = "text"
-	DeliveryPhoto DeliveryKind = "photo"
+	DeliveryText   DeliveryKind = "text"
+	DeliveryPhoto  DeliveryKind = "photo"
+	DeliveryWidget DeliveryKind = "widget"
 )
 
 // ParseMode определяет разметку текста.
@@ -27,6 +28,12 @@ type InlineButton struct{ Text, Data string }
 // InlineKeyboard содержит строки кнопок.
 type InlineKeyboard = [][]InlineButton
 
+// Widget содержит шаблон и начальные данные сообщения.
+type Widget struct {
+	HTML string
+	Data string
+}
+
 // Delivery содержит самостоятельное исходящее сообщение.
 type Delivery struct {
 	Kind      DeliveryKind
@@ -35,6 +42,7 @@ type Delivery struct {
 	ParseMode ParseMode
 	Keyboard  InlineKeyboard
 	PNG       []byte
+	Widget    Widget
 }
 
 // utf16Length возвращает длину строки в единицах UTF-16.
@@ -86,6 +94,14 @@ func (d Delivery) clone() Delivery {
 
 // validateContent проверяет поля выбранного вида доставки.
 func (d Delivery) validateContent() error {
+	if d.Kind == DeliveryWidget {
+		return d.validateWidget()
+	}
+
+	if d.Widget != (Widget{}) {
+		return ErrInvalidArgument
+	}
+
 	switch d.Kind {
 	case DeliveryText:
 		if d.Text == "" || d.Caption != "" || len(d.PNG) != 0 {
@@ -100,6 +116,16 @@ func (d Delivery) validateContent() error {
 			return ErrInvalidArgument
 		}
 	default:
+		return ErrInvalidArgument
+	}
+
+	return nil
+}
+
+// validateWidget проверяет размер шаблона, данные и подпись.
+func (d Delivery) validateWidget() error {
+	if d.Text != "" || d.Caption == "" || utf16Length(d.Caption) > 1024 || d.ParseMode != ParseModePlain ||
+		len(d.PNG) != 0 || len(d.Keyboard) != 0 || d.Widget.HTML == "" || len(d.Widget.HTML) > 32768 || len(d.Widget.Data) > maxWidgetData {
 		return ErrInvalidArgument
 	}
 

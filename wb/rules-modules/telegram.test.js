@@ -163,10 +163,119 @@ test('commands reject missing, stale, retained and duplicate ids', () => {
   assert.equal(sandbox.warnings.length, 1);
 });
 
+test('commands recover after the clock moves back without running future values', () => {
+  const sandbox = createSandbox();
+  const now = 2000000000000;
+  const calls = [];
+  sandbox.api.onCommand('ping', function (cmd) { calls.push(cmd.id); });
+  const then = sandbox.rules.telegram_command_ping.then;
+
+  sandbox.setNow(now - 10000);
+  then(JSON.stringify({ id: 'before-clock-change', ts: now / 1000 }));
+  then(JSON.stringify({ id: 'invalid-timestamp', ts: String((now - 10000) / 1000) }));
+  then(JSON.stringify({ id: 'after-clock-change', ts: (now - 10000) / 1000 }));
+
+  assert.deepEqual(calls, ['after-clock-change']);
+});
+
+test('ephemeral replies and boiler widget publish the supported wire payloads', () => {
+  const sandbox = createSandbox();
+  const now = 2000000000000;
+  let statusCommand;
+  let otherCommand;
+
+  sandbox.api.onCommand('boiler_status', function (cmd) { statusCommand = cmd; });
+  sandbox.api.onCommand('graph', function (cmd) { otherCommand = cmd; });
+  sandbox.rules.telegram_command_boiler_status.then(JSON.stringify({
+    id: 'status-1', ts: now / 1000, can_reply_ephemeral: true
+  }));
+  sandbox.rules.telegram_command_graph.then(JSON.stringify({
+    id: 'graph-1', ts: now / 1000, can_reply_ephemeral: true
+  }));
+
+  assert.equal(statusCommand.canReplyEphemeral, true);
+  statusCommand.replyEphemeral('Временный ответ');
+  assert.deepEqual(lastPayload(sandbox), {
+    text: 'Временный ответ', ephemeral: true, reply_to: 'status-1', id: lastPayload(sandbox).id
+  });
+  statusCommand.replyEphemeralChart({ title: 'Краткий график' });
+  assert.deepEqual(lastPayload(sandbox), {
+    chart: { title: 'Краткий график' }, ephemeral: true, reply_to: 'status-1', id: lastPayload(sandbox).id
+  });
+  statusCommand.replyBoilerWidget({ temperature: '54 °C', status: 'Работает' });
+  assert.deepEqual(lastPayload(sandbox), {
+    boiler_widget: { temperature: '54 °C', status: 'Работает' }, reply_to: 'status-1', id: lastPayload(sandbox).id
+  });
+
+  assert.throws(() => otherCommand.replyBoilerWidget({ temperature: 1, status: 'x' }), /только для boiler_status/);
+  sandbox.rules.telegram_command_graph.then(JSON.stringify({
+    id: 'graph-2', ts: now / 1000, can_reply_ephemeral: false
+  }));
+  assert.equal(otherCommand.canReplyEphemeral, false);
+  assert.throws(() => otherCommand.replyEphemeral('Нет'), /не поддерживает временный ответ/);
+  assert.throws(() => otherCommand.replyEphemeralChart({ title: 'Нет' }), /не поддерживает временный ответ/);
+});
+
 test('example includes callback-driven command pattern', () => {
   const example = fs.readFileSync(path.join(__dirname, '../rules-examples/telegram-example.js'), 'utf8');
 
   assert.match(example, /buttons:\s*\[\[/);
   assert.match(example, /cancel:\s*true/);
   assert.match(example, /tg\.onCommand\("gate"/);
+  assert.match(example, /replyBoilerWidget/);
+  assert.match(example, /replyEphemeralChart/);
+  assert.match(example, /boiler\/error_code/);
+});
+
+test('boiler widget redraws current chat data and keeps readings when data is invalid', () => {
+  const htmlPath = path.join(__dirname, '../../internal/bot/boiler_widget.html');
+  const html = fs.readFileSync(htmlPath, 'utf8');
+  const openTag = '<script>\n';
+  const start = html.indexOf(openTag);
+  const end = html.indexOf('\n</script>', start + openTag.length);
+  assert.ok(start >= 0 && end > start, 'widget template must contain its script block');
+  const script = html.slice(start + openTag.length, end);
+  const elements = Object.fromEntries(['temperature', 'status', 'updated', 'error', 'refresh'].map((id) => [id, {
+    textContent: '',
+    hidden: id === 'error',
+    disabled: false,
+    addEventListener() {}
+  }]));
+  let changed;
+  const widget = {
+    chatData: JSON.stringify({ temperature: '51 °C', status: 'Работает', updated_at: '12:00' }),
+    onEvent(name, callback) {
+      assert.equal(name, 'chatDataChanged');
+      changed = callback;
+    },
+    ready() {},
+    request() { throw new Error('unexpected request'); }
+  };
+  const context = vm.createContext({
+    window: { TelegramWidget: widget },
+    document: { getElementById(id) { return elements[id]; } },
+    JSON
+  });
+
+  vm.runInContext(script, context, { filename: htmlPath });
+  assert.equal(elements.temperature.textContent, '51 °C');
+  assert.equal(elements.status.textContent, 'Работает');
+  assert.equal(elements.updated.textContent, '12:00');
+
+  widget.chatData = JSON.stringify({ temperature: '53 °C', status: 'Нагрев', updated_at: '12:01' });
+  changed();
+  assert.equal(elements.temperature.textContent, '53 °C');
+  assert.equal(elements.status.textContent, 'Нагрев');
+  assert.equal(elements.updated.textContent, '12:01');
+
+  widget.chatData = '{';
+  changed();
+  assert.equal(elements.temperature.textContent, '53 °C');
+  assert.equal(elements.error.hidden, false);
+  assert.equal(elements.error.textContent, 'Не удалось прочитать показания');
+
+  widget.chatData = JSON.stringify({ temperature: '54 °C', status: 'Работает', updated_at: '12:02' });
+  changed();
+  assert.equal(elements.temperature.textContent, '54 °C');
+  assert.equal(elements.error.hidden, true);
 });

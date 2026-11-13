@@ -114,6 +114,8 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch method {
+	case "getMe":
+		writeResult(w, `{"id":123,"is_bot":true,"first_name":"Home","username":"MyHomeBot"}`)
 	case "getUpdates":
 		f.handleGetUpdates(w)
 	case "deleteWebhook":
