@@ -31,7 +31,12 @@ type serviceSettings struct {
 
 // runService запускает бота и возвращает код выхода (таблица кодов — README, раздел «Ошибки и диагностика»).
 func runService(ctx context.Context, s serviceSettings) int {
-	cfg, errLoad := config.Load(s.configPath)
+	return runServiceWithBackend(ctx, s, localService{})
+}
+
+// runServiceWithBackend выполняет запуск через зависимости сервиса.
+func runServiceWithBackend(ctx context.Context, s serviceSettings, backend ServiceBackend) int {
+	cfg, errLoad := backend.LoadConfig(s.configPath)
 	if errLoad != nil {
 		slog.Error("конфиг не прочитан, исправьте его в веб-интерфейсе", "path", s.configPath, "err", errLoad)
 
@@ -49,15 +54,15 @@ func runService(ctx context.Context, s serviceSettings) int {
 
 	if !cfg.Enabled {
 		slog.Info("Бот выключен в настройках")
-		purgeDevice(broker)
+		backend.PurgeDevice(broker)
 
 		return 0
 	}
 
-	token, errToken := config.NewTokenStore(s.tokenPath).Read()
+	token, errToken := backend.ReadToken(s.tokenPath)
 	if errors.Is(errToken, config.ErrNoToken) {
 		slog.Info("Токен не задан, задайте его в веб-интерфейсе")
-		purgeDevice(broker)
+		backend.PurgeDevice(broker)
 
 		return 0
 	}
@@ -68,7 +73,7 @@ func runService(ctx context.Context, s serviceSettings) int {
 		return 1
 	}
 
-	return runBot(ctx, cfg, token, broker, s.apiURL)
+	return backend.RunBot(ctx, cfg, token, broker, s.apiURL)
 }
 
 // runBot собирает компоненты и запускает сервис.
@@ -80,21 +85,15 @@ func runBot(ctx context.Context, cfg *config.Config, token, broker, apiURL strin
 		return 1
 	}
 
-	// core создаётся последним (ему нужны устройство и клиент), а обработчики устройства и клиента
-	// ссылаются на него; вызываются они только после application.Run, когда core уже задан.
-	var core *bot.Bot
+	handlers := &serviceHandlers{}
 
 	device, errDevice := wbdevice.New(bot.DeviceID,
 		wbdevice.WithBroker(broker),
 		wbdevice.WithDriver(bot.Driver),
 		wbdevice.WithTitle("Telegram Bot", "Telegram-бот"),
 		wbdevice.WithControls(bot.Controls(cfg)...),
-		wbdevice.WithWriteHandler(func(controlID string, payload []byte) {
-			if controlID == bot.SendControl {
-				core.HandleSend(payload)
-			}
-		}),
-		wbdevice.WithOnConnection(func(ok bool) { core.ReportMQTT(ok) }),
+		wbdevice.WithWriteHandler(handlers.write),
+		wbdevice.WithOnConnection(handlers.mqtt),
 	)
 	if errDevice != nil {
 		slog.Error("не удалось создать MQTT-устройство", "err", errDevice)
@@ -118,48 +117,47 @@ func runBot(ctx context.Context, cfg *config.Config, token, broker, apiURL strin
 
 	telegramOptions := []telegram.Option{
 		telegram.WithTimeouts(cfg.ConnectTimeout(), cfg.PollTimeout()),
-		telegram.WithCallbackHandler(func(handlerCtx context.Context, callback telegram.Callback) {
-			core.HandleCallback(handlerCtx, callback)
-		}),
-		telegram.WithWidgetQueryHandler(func(handlerCtx context.Context, query telegram.WidgetQuery) {
-			core.HandleWidgetQuery(handlerCtx, query)
-		}),
+		telegram.WithCallbackHandler(handlers.callback),
+		telegram.WithWidgetQueryHandler(handlers.widget),
 		telegram.WithOnFatal(application.Terminate),
-		telegram.WithOnDelivery(func(err error) { core.ReportDelivery(err) }),
-		telegram.WithOnConnection(func(ok bool, reason string) { core.ReportTelegram(ok, reason) }),
+		telegram.WithOnDelivery(handlers.delivery),
+		telegram.WithOnConnection(handlers.connection),
 	}
 
 	if apiURL != "" {
 		telegramOptions = append(telegramOptions, telegram.WithServerURL(apiURL))
 	}
 
-	client, errClient := telegram.New(token, func(handlerCtx context.Context, msg telegram.Message) {
-		core.HandleMessage(handlerCtx, msg)
-	}, telegramOptions...)
+	client, errClient := telegram.New(token, handlers.message, telegramOptions...)
 	if errClient != nil {
 		slog.Error("не удалось создать Telegram-клиент", "err", errClient)
 
 		return 1
 	}
 
-	var errCore error
-
-	core, errCore = bot.New(cfg, device, client, bot.WithVersion(version), bot.WithChartBuilder(builder))
+	core, errCore := bot.New(cfg, device, client, bot.WithVersion(version), bot.WithChartBuilder(builder))
 	if errCore != nil {
 		slog.Error("не удалось создать ядро бота", "err", errCore)
 
 		return 1
 	}
 
+	handlers.core = core
+
 	application.AddComponent(device, history, client, core)
 
 	slog.Info("wb-telegram запущен", "version", version, "users", len(cfg.Users), "commands", len(cfg.Commands))
 
+	return runApplication(ctx, application, broker, localService{})
+}
+
+// runApplication возвращает код завершения приложения и убирает устройство при отказе токена.
+func runApplication(ctx context.Context, application ApplicationRunner, broker string, purger DevicePurger) int {
 	errRun := application.Run(ctx)
 
 	if errors.Is(errRun, telegram.ErrUnauthorized) {
 		slog.Error("Telegram отклонил токен, задайте новый в веб-интерфейсе")
-		purgeDevice(broker)
+		purger.PurgeDevice(broker)
 
 		return 0
 	}

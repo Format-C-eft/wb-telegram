@@ -7,7 +7,9 @@ import (
 	"slices"
 )
 
-// Component — компонент, жизненным циклом которого управляет App.
+//go:generate ../../bin/mockgen -source=component.go -destination=mock/component_mock.go -package=mock
+
+// Component управляет жизненным циклом части сервиса.
 // Run не блокирует: запускает фоновую работу и возвращается.
 type Component interface {
 	Run(ctx context.Context) error

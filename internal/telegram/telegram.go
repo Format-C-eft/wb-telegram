@@ -116,10 +116,15 @@ func New(token string, handler Handler, opts ...Option) (*Client, error) {
 		updates = append(updates, models.AllowedUpdateWidgetQuery)
 	}
 
+	httpClient := o.httpClient
+	if httpClient == nil {
+		httpClient = newHTTPClient(o.connectTimeout, o.pollTimeout)
+	}
+
 	api, errNew := bot.New(token,
 		bot.WithSkipGetMe(),
 		bot.WithServerURL(o.serverURL),
-		bot.WithHTTPClient(o.pollTimeout, &healthClient{inner: newHTTPClient(o.connectTimeout, o.pollTimeout), alive: c.markHealthy}),
+		bot.WithHTTPClient(o.pollTimeout, &healthClient{inner: httpClient, alive: c.markHealthy}),
 		bot.WithAllowedUpdates(updates),
 		bot.WithNotAsyncHandlers(),
 		bot.WithDefaultHandler(c.dispatch(handler)),

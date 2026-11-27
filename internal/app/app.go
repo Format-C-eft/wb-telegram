@@ -1,3 +1,4 @@
+// Package app управляет жизненным циклом компонентов сервиса.
 package app
 
 import (

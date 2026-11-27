@@ -18,16 +18,18 @@ const purgeTimeout = 5 * time.Second
 // purgeSeq делает client id уборок уникальными в пределах процесса.
 var purgeSeq atomic.Int64
 
-// purgeClientID возвращает уникальный client id уборки: брокер отключает прежнего клиента
-// с тем же id, поэтому одновременные уборки (или уборка и запущенный экземпляр) не должны его делить.
-// Id не длиннее 23 символов — столько MQTT 3.1.1 гарантирует любому брокеру.
+// purgeClientID возвращает уникальный идентификатор MQTT-клиента уборки.
 func purgeClientID() string {
 	return "tgpurge-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(purgeSeq.Add(1), 10)
 }
 
-// Purge удаляет устройство из брокера целиком: публикует пустые retained-сообщения во все его топики,
-// найденные за окно window.
+// Purge удаляет retained-топики устройства, найденные за заданное окно.
 func Purge(broker, deviceID string, window time.Duration) error {
+	return purge(broker, deviceID, window, paho.NewClient)
+}
+
+// purge удаляет устройство через заданную фабрику MQTT-клиента.
+func purge(broker, deviceID string, window time.Duration, factory func(*paho.ClientOptions) paho.Client) error {
 	if !identifierPattern.MatchString(deviceID) {
 		return &Error{kind: kindInvalidArgument, Op: "purge", Message: "bad device id " + deviceID}
 	}
@@ -38,7 +40,7 @@ func Purge(broker, deviceID string, window time.Duration) error {
 		SetCleanSession(true).
 		SetConnectTimeout(purgeTimeout)
 
-	client := paho.NewClient(clientOptions)
+	client := factory(clientOptions)
 
 	token := client.Connect()
 	if !token.WaitTimeout(purgeTimeout) {
@@ -59,8 +61,7 @@ func Purge(broker, deviceID string, window time.Duration) error {
 	return clearTopics(client, topics)
 }
 
-// removeStale удаляет из брокера контролы устройства, которых нет в текущем наборе.
-// Уборка не обязательна для работы устройства, поэтому ошибки только пишутся в журнал.
+// removeStale удаляет retained-топики контролов, отсутствующих в текущем наборе.
 func (d *Device) removeStale() {
 	topics, errCollect := collectRetained(d.client, devicesPrefix+d.id+"/controls/#", d.options.staleWindow, d.stop)
 	if errCollect != nil {
@@ -94,8 +95,7 @@ func (d *Device) removeStale() {
 	}
 }
 
-// collectRetained подписывается на filter и собирает топики с непустыми retained-сообщениями за окно window.
-// Если stop закрывается раньше конца окна, сбор прерывается и возвращается пустой список.
+// collectRetained собирает непустые retained-топики указанного фильтра.
 func collectRetained(client paho.Client, filter string, window time.Duration, stop <-chan struct{}) ([]string, error) {
 	var (
 		mu     sync.Mutex

@@ -3,78 +3,23 @@ package app
 import (
 	"context"
 	"errors"
-	"slices"
-	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/app/mock"
 )
 
-// recorder собирает журнал вызовов компонентов в порядке их выполнения.
-type recorder struct {
-	mu  sync.Mutex
-	log []string
-}
-
-// add добавляет запись в журнал.
-func (r *recorder) add(entry string) {
-	r.mu.Lock()
-	r.log = append(r.log, entry)
-	r.mu.Unlock()
-}
-
-// entries возвращает копию журнала.
-func (r *recorder) entries() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return slices.Clone(r.log)
-}
-
-// fakeComponent — компонент, который пишет свои вызовы в recorder.
-type fakeComponent struct {
-	name    string
-	rec     *recorder
-	runErr  error
-	started chan struct{}
-}
-
-// Run записывает запуск и сигнализирует о нём.
-func (c *fakeComponent) Run(_ context.Context) error {
-	c.rec.add("run " + c.name)
-
-	if c.started != nil {
-		close(c.started)
-	}
-
-	return c.runErr
-}
-
-// Stop записывает остановку.
-func (c *fakeComponent) Stop() error {
-	c.rec.add("stop " + c.name)
-
-	return nil
-}
-
-// gracefulComponent — компонент с context-aware остановкой.
-type gracefulComponent struct {
-	fakeComponent
-}
-
-// Shutdown записывает мягкую остановку.
-func (c *gracefulComponent) Shutdown(_ context.Context) error {
-	c.rec.add("shutdown " + c.name)
-
-	return nil
-}
-
 // newTestApp создаёт App без подписки на реальные сигналы.
-func newTestApp(t *testing.T) *App {
+func newTestApp(t *testing.T, opts ...Option) *App {
 	t.Helper()
 
-	a, errNew := New(withSignalContext(func() (context.Context, context.CancelFunc) {
+	opts = append(opts, withSignalContext(func() (context.Context, context.CancelFunc) {
 		return context.WithCancel(context.Background())
 	}))
+
+	a, errNew := New(opts...)
 	if errNew != nil {
 		t.Fatalf("New: %v", errNew)
 	}
@@ -86,73 +31,115 @@ func newTestApp(t *testing.T) *App {
 func TestRunOrder(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{}
+	ctrl := gomock.NewController(t)
 	a := newTestApp(t)
-	last := &fakeComponent{name: "b", rec: rec, started: make(chan struct{})}
+	first := mock.NewMockComponent(ctrl)
+	graceful := mock.NewMockGracefulComponent(ctrl)
+	last := mock.NewMockComponent(ctrl)
+	started := make(chan struct{})
+	stopped := false
+	closers := 0
 
-	a.AddComponent(&fakeComponent{name: "a", rec: rec}, &gracefulComponent{fakeComponent{name: "g", rec: rec}}, last)
+	gomock.InOrder(
+		first.EXPECT().Run(gomock.Any()).Return(nil),
+		graceful.EXPECT().Run(gomock.Any()).Return(nil),
+		last.EXPECT().Run(gomock.Any()).DoAndReturn(func(context.Context) error {
+			close(started)
+
+			return nil
+		}),
+		last.EXPECT().Stop().Return(nil),
+		graceful.EXPECT().Shutdown(gomock.Any()).Return(nil),
+		first.EXPECT().Stop().DoAndReturn(func() error {
+			stopped = true
+
+			return nil
+		}),
+	)
+
+	a.AddComponent(first, graceful, last)
 	a.AddCloser(func() error {
-		rec.add("closer")
+		if !stopped || closers != 1 {
+			t.Error("first closer ran before components or second closer")
+		}
+
+		closers++
+
+		return nil
+	}, func() error {
+		if !stopped || closers != 0 {
+			t.Error("second closer ran before components")
+		}
+
+		closers++
 
 		return nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	done := make(chan error, 1)
 
 	go func() { done <- a.Run(ctx) }()
 
-	<-last.started
+	<-started
 	cancel()
 
 	errRun := <-done
-	if errRun != nil {
-		t.Fatalf("Run: %v", errRun)
-	}
-
-	want := []string{"run a", "run g", "run b", "stop b", "shutdown g", "stop a", "closer"}
-	if got := rec.entries(); !slices.Equal(got, want) {
-		t.Fatalf("log = %v, want %v", got, want)
+	if errRun != nil || closers != 2 {
+		t.Fatalf("Run error=%v closers=%d", errRun, closers)
 	}
 }
 
-// TestRunRollbackOnStartError проверяет остановку уже запущенных компонентов при ошибке старта.
+// TestRunRollbackOnStartError проверяет откат успешно запущенных компонентов.
 func TestRunRollbackOnStartError(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{}
+	ctrl := gomock.NewController(t)
 	a := newTestApp(t)
 	errBoom := errors.New("boom")
+	first := mock.NewMockComponent(ctrl)
+	failed := mock.NewMockComponent(ctrl)
+	remaining := mock.NewMockComponent(ctrl)
 
-	a.AddComponent(&fakeComponent{name: "a", rec: rec}, &fakeComponent{name: "b", rec: rec, runErr: errBoom}, &fakeComponent{name: "c", rec: rec})
+	gomock.InOrder(
+		first.EXPECT().Run(gomock.Any()).Return(nil),
+		failed.EXPECT().Run(gomock.Any()).Return(errBoom),
+		first.EXPECT().Stop().Return(nil),
+	)
+
+	a.AddComponent(first, failed, remaining)
 
 	errRun := a.Run(context.Background())
 	if !errors.Is(errRun, errBoom) {
 		t.Fatalf("Run error = %v, want boom", errRun)
 	}
-
-	want := []string{"run a", "run b", "stop a"}
-	if got := rec.entries(); !slices.Equal(got, want) {
-		t.Fatalf("log = %v, want %v", got, want)
-	}
 }
 
-// TestRunTerminateCause проверяет, что причина Terminate возвращается из Run.
+// TestRunTerminateCause проверяет возвращение первой причины Terminate.
 func TestRunTerminateCause(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{}
+	ctrl := gomock.NewController(t)
 	a := newTestApp(t)
 	errCause := errors.New("token rejected")
-	comp := &fakeComponent{name: "a", rec: rec, started: make(chan struct{})}
+	component := mock.NewMockComponent(ctrl)
+	started := make(chan struct{})
 
-	a.AddComponent(comp)
+	component.EXPECT().Run(gomock.Any()).DoAndReturn(func(context.Context) error {
+		close(started)
+
+		return nil
+	})
+	component.EXPECT().Stop().Return(nil)
+	a.AddComponent(component)
 
 	done := make(chan error, 1)
 
 	go func() { done <- a.Run(context.Background()) }()
 
-	<-comp.started
+	<-started
 	a.Terminate(errCause)
 	a.Terminate(errors.New("ignored second cause"))
 
@@ -185,21 +172,37 @@ func TestRunErrors(t *testing.T) {
 	t.Run("already running", func(t *testing.T) {
 		t.Parallel()
 
-		rec := &recorder{}
+		ctrl := gomock.NewController(t)
 		a := newTestApp(t)
-		comp := &fakeComponent{name: "a", rec: rec, started: make(chan struct{})}
+		component := mock.NewMockComponent(ctrl)
+		started := make(chan struct{})
 
-		a.AddComponent(comp)
+		component.EXPECT().Run(gomock.Any()).DoAndReturn(func(context.Context) error {
+			close(started)
 
-		ctx := t.Context()
+			return nil
+		})
+		component.EXPECT().Stop().Return(nil)
+		a.AddComponent(component)
 
-		go func() { _ = a.Run(ctx) }()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-		<-comp.started
+		done := make(chan error, 1)
+
+		go func() { done <- a.Run(ctx) }()
+
+		<-started
 
 		errRun := a.Run(ctx)
 		if !errors.Is(errRun, ErrAlreadyRunning) {
 			t.Fatalf("second Run error = %v, want ErrAlreadyRunning", errRun)
+		}
+
+		cancel()
+
+		if errFirst := <-done; errFirst != nil {
+			t.Fatal(errFirst)
 		}
 	})
 }
@@ -214,112 +217,131 @@ func TestNewValidatesOptions(t *testing.T) {
 	}
 }
 
-// ctxComponent — компонент, наблюдающий отмену своего контекста.
-type ctxComponent struct {
-	fakeComponent
-	canceled chan struct{}
-	onRun    func()
-}
-
-// Run запускает горутину, ожидающую отмены контекста.
-func (c *ctxComponent) Run(ctx context.Context) error {
-	go func() {
-		<-ctx.Done()
-		close(c.canceled)
-	}()
-
-	if c.onRun != nil {
-		c.onRun()
-	}
-
-	return c.fakeComponent.Run(ctx)
-}
-
-// TestRunCancelsComponentContext проверяет отмену контекста компонентов после Terminate.
+// TestRunCancelsComponentContext проверяет отмену контекста после Terminate.
 func TestRunCancelsComponentContext(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{}
+	ctrl := gomock.NewController(t)
 	a := newTestApp(t)
-	comp := &ctxComponent{
-		fakeComponent: fakeComponent{name: "a", rec: rec, started: make(chan struct{})},
-		canceled:      make(chan struct{}),
-	}
+	component := mock.NewMockComponent(ctrl)
+	started := make(chan context.Context, 1)
 
-	a.AddComponent(comp)
+	component.EXPECT().Run(gomock.Any()).DoAndReturn(func(ctx context.Context) error {
+		started <- ctx
+
+		return nil
+	})
+	component.EXPECT().Stop().Return(nil)
+	a.AddComponent(component)
 
 	done := make(chan error, 1)
 
 	go func() { done <- a.Run(context.Background()) }()
 
-	<-comp.started
-	a.Terminate(errors.New("stop"))
+	ctx := <-started
+	errCause := errors.New("stop")
+	a.Terminate(errCause)
 
 	select {
-	case <-comp.canceled:
+	case <-ctx.Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("component context was not canceled")
 	}
 
-	<-done
+	if errRun := <-done; !errors.Is(errRun, errCause) {
+		t.Fatal(errRun)
+	}
 }
 
-// TestRunTerminateDuringStart проверяет откат при Terminate во время медленного запуска.
+// TestRunTerminateDuringStart проверяет откат после Terminate во время запуска.
 func TestRunTerminateDuringStart(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{}
 	a := newTestApp(t)
 	errCause := errors.New("cause")
-	slow := &ctxComponent{
-		fakeComponent: fakeComponent{name: "slow", rec: rec},
-		canceled:      make(chan struct{}),
-	}
 
-	slow.onRun = func() {
-		a.Terminate(errCause)
-		<-slow.canceled
-	}
-
-	a.AddComponent(&fakeComponent{name: "a", rec: rec}, slow, &fakeComponent{name: "c", rec: rec})
+	expectInterruptedStart(t, a, func() { a.Terminate(errCause) })
 
 	errRun := a.Run(context.Background())
 	if !errors.Is(errRun, errCause) {
 		t.Fatalf("Run error = %v, want cause", errRun)
 	}
-
-	want := []string{"run a", "run slow", "stop slow", "stop a"}
-	if got := rec.entries(); !slices.Equal(got, want) {
-		t.Fatalf("log = %v, want %v", got, want)
-	}
 }
 
-// TestRunCancelDuringStart проверяет, что отмена ctx во время запуска останавливает уже запущенные компоненты.
+// TestRunCancelDuringStart проверяет откат при отмене внешнего контекста.
 func TestRunCancelDuringStart(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{}
 	a := newTestApp(t)
+
 	ctx, cancel := context.WithCancel(context.Background())
-	slow := &ctxComponent{
-		fakeComponent: fakeComponent{name: "slow", rec: rec},
-		canceled:      make(chan struct{}),
-	}
+	defer cancel()
 
-	slow.onRun = func() {
-		cancel()
-		<-slow.canceled
-	}
-
-	a.AddComponent(&fakeComponent{name: "a", rec: rec}, slow, &fakeComponent{name: "c", rec: rec})
+	expectInterruptedStart(t, a, cancel)
 
 	errRun := a.Run(ctx)
 	if errRun != nil {
 		t.Fatalf("Run: %v", errRun)
 	}
+}
 
-	want := []string{"run a", "run slow", "stop slow", "stop a"}
-	if got := rec.entries(); !slices.Equal(got, want) {
-		t.Fatalf("log = %v, want %v", got, want)
+// expectInterruptedStart задаёт прерывание второго запуска и обратный откат.
+func expectInterruptedStart(t *testing.T, a *App, interrupt func()) {
+	t.Helper()
+
+	ctrl := gomock.NewController(t)
+	first := mock.NewMockComponent(ctrl)
+	slow := mock.NewMockComponent(ctrl)
+	remaining := mock.NewMockComponent(ctrl)
+
+	gomock.InOrder(
+		first.EXPECT().Run(gomock.Any()).Return(nil),
+		slow.EXPECT().Run(gomock.Any()).DoAndReturn(func(ctx context.Context) error {
+			interrupt()
+			<-ctx.Done()
+
+			return nil
+		}),
+		slow.EXPECT().Stop().Return(nil),
+		first.EXPECT().Stop().Return(nil),
+	)
+
+	a.AddComponent(first, slow, remaining)
+}
+
+// TestRunShutdownTimeout проверяет срок мягкой остановки и выполнение closers.
+func TestRunShutdownTimeout(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	a := newTestApp(t, WithShutdownTimeout(10*time.Millisecond))
+	component := mock.NewMockGracefulComponent(ctrl)
+	closed := false
+
+	component.EXPECT().Run(gomock.Any()).DoAndReturn(func(context.Context) error {
+		a.Terminate(nil)
+
+		return nil
+	})
+	component.EXPECT().Shutdown(gomock.Any()).DoAndReturn(func(ctx context.Context) error {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("Shutdown has no deadline")
+		}
+
+		<-ctx.Done()
+
+		return ctx.Err()
+	})
+
+	a.AddComponent(component)
+	a.AddCloser(func() error {
+		closed = true
+
+		return nil
+	})
+
+	errRun := a.Run(context.Background())
+	if !errors.Is(errRun, context.DeadlineExceeded) || !closed {
+		t.Fatalf("Run error=%v closer=%v", errRun, closed)
 	}
 }

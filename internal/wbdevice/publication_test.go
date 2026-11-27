@@ -5,59 +5,102 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/wbdevice/mock"
 )
 
-// TestSetValueCancellationBeforePublish проверяет отмену до постановки в MQTT.
+// TestSetValueCancellationBeforePublish проверяет отмену ожидания блокировки.
 func TestSetValueCancellationBeforePublish(t *testing.T) {
 	t.Parallel()
 
-	dev, errNew := New("telegram_bot", WithControls(testControls()...))
-	if errNew != nil {
-		t.Fatal(errNew)
-	}
+	dev, _, _, _ := newMockDevice(t)
 
 	dev.controlLock <- struct{}{}
 	defer dev.unlockControls()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
 
-	errPublish := dev.SetValue(ctx, "cmd_gate", `{"id":"expired"}`)
-	if !errors.Is(errPublish, context.DeadlineExceeded) {
-		t.Fatalf("SetValue = %v, want context deadline", errPublish)
+	errPublish := dev.SetValue(ctx, "cmd_gate", "expired")
+	if !errors.Is(errPublish, context.Canceled) {
+		t.Fatalf("SetValue = %v", errPublish)
 	}
 }
 
-// TestSetValueCancellationAfterPublish проверяет отмену ожидания PUBACK.
-func TestSetValueCancellationAfterPublish(t *testing.T) {
+// TestSetValueUnconfirmed проверяет таймаут, отмену и остановку ожидания PUBACK.
+func TestSetValueUnconfirmed(t *testing.T) {
 	t.Parallel()
 
-	srv, broker := startBrokerServer(t)
-	dev := startDevice(t, broker, nil, testControls()...)
+	for _, reason := range []string{"timeout", "cancel", "stop"} {
+		t.Run(reason, func(t *testing.T) {
+			t.Parallel()
 
-	hook := &rejectOnceHook{topic: controlTopic("telegram_bot", "cmd_gate")}
+			dev, client, _, controller := newMockDevice(t, WithTimeout(20*time.Millisecond))
+			client.EXPECT().IsConnectionOpen().Return(true)
 
-	errHook := srv.AddHook(hook, nil)
-	if errHook != nil {
-		t.Fatal(errHook)
+			token := mock.NewMockToken(controller)
+			token.EXPECT().Done().Return(make(chan struct{})).AnyTimes()
+			published := make(chan struct{})
+
+			client.EXPECT().Publish(controlTopic(dev.id, "cmd_gate"), byte(1), true, "unconfirmed").DoAndReturn(func(string, byte, bool, any) any {
+				close(published)
+
+				return token
+			})
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			result := make(chan error, 1)
+			go func() { result <- dev.SetValue(ctx, "cmd_gate", "unconfirmed") }()
+
+			<-published
+
+			switch reason {
+			case "cancel":
+				cancel()
+			case "stop":
+				dev.stopOnce.Do(func() { close(dev.stop) })
+			}
+
+			select {
+			case errPublish := <-result:
+				if !errors.Is(errPublish, ErrTimeout) || dev.values["cmd_gate"] != "{}" {
+					t.Fatalf("SetValue = %v, value = %q", errPublish, dev.values["cmd_gate"])
+				}
+			case <-time.After(time.Second):
+				t.Fatal("SetValue did not stop waiting for PUBACK")
+			}
+		})
 	}
+}
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
+// TestWaitPublished проверяет отказ MQTT и отсутствие PUBACK.
+func TestWaitPublished(t *testing.T) {
+	t.Parallel()
 
-	result := make(chan error, 1)
+	for _, timedOut := range []bool{false, true} {
+		t.Run(map[bool]string{false: "mqtt", true: "timeout"}[timedOut], func(t *testing.T) {
+			t.Parallel()
 
-	go func() { result <- dev.SetValue(ctx, "cmd_gate", `{"id":"unconfirmed"}`) }()
+			controller := gomock.NewController(t)
+			token := mock.NewMockToken(controller)
+			token.EXPECT().WaitTimeout(time.Millisecond).Return(!timedOut)
 
-	waitFor(t, "publication received without PUBACK", hook.rejected.Load)
-	cancel()
+			want := ErrTimeout
 
-	select {
-	case errPublish := <-result:
-		if !errors.Is(errPublish, ErrTimeout) {
-			t.Fatalf("SetValue = %v, want unconfirmed publication", errPublish)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("SetValue waited for PUBACK after cancellation")
+			if !timedOut {
+				token.EXPECT().Error().Return(errors.New("publish denied"))
+
+				want = ErrMQTT
+			}
+
+			errPublish := waitPublished(token, "/devices/telegram_bot/meta", time.Millisecond)
+			if !errors.Is(errPublish, want) {
+				t.Fatalf("waitPublished = %v, want %v", errPublish, want)
+			}
+		})
 	}
 }

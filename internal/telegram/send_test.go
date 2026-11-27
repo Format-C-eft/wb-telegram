@@ -315,7 +315,7 @@ func TestSendAfterShutdownWithoutRun(t *testing.T) {
 
 	api := newFakeAPI(t)
 
-	client, errNew := New(testToken, func(context.Context, Message) {}, WithServerURL(api.server.URL))
+	client, errNew := New(testToken, func(context.Context, Message) {}, WithServerURL("https://api.telegram.test"), WithHTTPClient(api.client))
 	if errNew != nil {
 		t.Fatalf("New: %v", errNew)
 	}

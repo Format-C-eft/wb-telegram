@@ -2,34 +2,40 @@ package wbdevice
 
 import (
 	"time"
+
+	paho "github.com/eclipse/paho.mqtt.golang"
 )
 
 // Option настраивает Device.
 type Option func(*options)
 
-// options — настройки Device.
+//go:generate ../../bin/mockgen -destination=mock/client_mock.go -package=mock github.com/eclipse/paho.mqtt.golang Client,Token,Message
+
+// options - настройки Device.
 type options struct {
-	broker      string
-	clientID    string
-	driver      string
-	title       map[string]string
-	controls    []Control
-	onWrite     WriteHandler
-	onConnected func(ok bool)
-	timeout     time.Duration
-	staleWindow time.Duration
+	broker        string
+	clientID      string
+	driver        string
+	title         map[string]string
+	controls      []Control
+	onWrite       WriteHandler
+	onConnected   func(ok bool)
+	timeout       time.Duration
+	staleWindow   time.Duration
+	clientFactory func(*paho.ClientOptions) paho.Client
 }
 
 // defaultOptions возвращает настройки по умолчанию.
 func defaultOptions() options {
 	return options{
-		broker:      DefaultBroker(MosquittoSocket),
-		clientID:    "wb-telegram",
-		driver:      "wb-telegram",
-		title:       map[string]string{"en": "Telegram Bot", "ru": "Telegram-бот"},
-		timeout:     10 * time.Second,
-		staleWindow: time.Second,
-		onConnected: func(bool) {},
+		clientFactory: paho.NewClient,
+		broker:        DefaultBroker(MosquittoSocket),
+		clientID:      "wb-telegram",
+		driver:        "wb-telegram",
+		title:         map[string]string{"en": "Telegram Bot", "ru": "Telegram-бот"},
+		timeout:       10 * time.Second,
+		staleWindow:   time.Second,
+		onConnected:   func(bool) {},
 	}
 }
 
@@ -65,9 +71,7 @@ func (o options) Validate() error {
 	return nil
 }
 
-// WithOnConnection задаёт реакцию на связь с брокером: ok=true, когда устройство опубликовано
-// и готово (в том числе после переподключения), ok=false при потере связи. Вызовы идут
-// последовательно, обработчик не должен блокироваться или менять состояние подключения.
+// WithOnConnection задаёт обработчик готовности и переподключения устройства.
 func WithOnConnection(f func(ok bool)) Option {
 	return func(o *options) { o.onConnected = f }
 }

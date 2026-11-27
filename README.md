@@ -449,9 +449,9 @@ make clean       # удалить бинарь
 make deploy CONTROLLER=root@<ip-контроллера> SSH_KEY=~/.ssh/<ключ>   # быстрая выкладка бинаря поверх пакета
 ```
 
-Архитектура бинаря: `make build DEB_TARGET_ARCH=armhf` (WB6/WB7). Тесты не ходят в сеть:
-Telegram подменяется `httptest.Server`, MQTT — встроенным брокером mochi-mqtt на
-`127.0.0.1:0`.
+Архитектура бинаря: `make build DEB_TARGET_ARCH=armhf` (WB6/WB7). Тесты не открывают
+сетевые слушатели: HTTP-клиент Telegram, MQTT-клиенты и зависимости запуска
+подменяются сгенерированными моками `go.uber.org/mock`.
 
 Раскладка:
 
@@ -513,8 +513,8 @@ make deb ARCH=armhf DEB_VERSION=0.1.999
 - **Устаревшие команды не выполняются**, чтобы ворота не открылись через час
   после нажатия, а повтор retained-значения после рестарта не выполнил команду
   второй раз.
-- **Минимум зависимостей**: только go-telegram/bot и paho.mqtt.golang (в тестах —
-  mochi-mqtt и go.uber.org/mock).
+- **Минимум зависимостей**: только go-telegram/bot и paho.mqtt.golang, в тестах -
+  go.uber.org/mock.
 
 Подробнее — [docs/adr/0001-architecture.md](docs/adr/0001-architecture.md).
 

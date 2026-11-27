@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -103,7 +102,7 @@ func TestPhotoRetryReader(t *testing.T) {
 		uploads [][]byte
 	)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpClient := newHTTPFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 4<<20)
 
 		errForm := r.ParseMultipartForm(4 << 20) //nolint:gosec // тело ограничено MaxBytesReader
@@ -150,10 +149,9 @@ func TestPhotoRetryReader(t *testing.T) {
 		if errWrite != nil {
 			t.Error(errWrite)
 		}
-	}))
-	defer server.Close()
+	})
 
-	client, errNew := New(testToken, func(context.Context, Message) {}, WithServerURL(server.URL), WithRateLimits(0, 0), withSleep(noSleep))
+	client, errNew := New(testToken, func(context.Context, Message) {}, WithHTTPClient(httpClient), WithRateLimits(0, 0), withSleep(noSleep))
 	if errNew != nil {
 		t.Fatal(errNew)
 	}
@@ -175,7 +173,7 @@ func TestPhotoRetryReader(t *testing.T) {
 func TestEphemeralPhoto(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpClient := newHTTPFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 4<<20)
 
 		errForm := r.ParseMultipartForm(4 << 20) //nolint:gosec // тело ограничено MaxBytesReader
@@ -206,10 +204,9 @@ func TestEphemeralPhoto(t *testing.T) {
 		}
 
 		writeResult(w, `{"message_id":0,"date":1,"chat":{"id":1,"type":"private"},"ephemeral_message_id":2}`)
-	}))
-	defer server.Close()
+	})
 
-	client, errNew := New(testToken, func(context.Context, Message) {}, WithServerURL(server.URL))
+	client, errNew := New(testToken, func(context.Context, Message) {}, WithHTTPClient(httpClient))
 	if errNew != nil {
 		t.Fatal(errNew)
 	}
@@ -255,7 +252,7 @@ func TestControlRequests(t *testing.T) {
 	entered := make(chan struct{}, 4)
 	release := make(chan struct{})
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpClient := newHTTPFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		entered <- struct{}{}
 
 		<-release
@@ -264,10 +261,9 @@ func TestControlRequests(t *testing.T) {
 		if errWrite != nil {
 			t.Error(errWrite)
 		}
-	}))
-	defer server.Close()
+	})
 
-	client, errNew := New(testToken, func(context.Context, Message) {}, WithServerURL(server.URL))
+	client, errNew := New(testToken, func(context.Context, Message) {}, WithHTTPClient(httpClient))
 	if errNew != nil {
 		t.Fatal(errNew)
 	}
@@ -333,7 +329,7 @@ func TestDeliveryLimitsStartAfterResponse(t *testing.T) {
 			secondStarted := make(chan time.Time, 1)
 			attempts := 0
 
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			httpClient := newHTTPFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				clockMu.Lock()
 				attempts++
 				attempt := attempts
@@ -352,12 +348,11 @@ func TestDeliveryLimitsStartAfterResponse(t *testing.T) {
 				}
 
 				_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1,"date":1,"chat":{"id":1,"type":"private"}}}`)
-			}))
-			defer server.Close()
+			})
 
 			waits := make(chan time.Duration, 1)
 
-			client, errNew := New(testToken, func(context.Context, Message) {}, WithServerURL(server.URL), withSleep(func(ctx context.Context, pause time.Duration) bool {
+			client, errNew := New(testToken, func(context.Context, Message) {}, WithHTTPClient(httpClient), withSleep(func(ctx context.Context, pause time.Duration) bool {
 				waits <- pause
 
 				clockMu.Lock()

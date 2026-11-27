@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,40 +10,47 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/telegram/mock"
 )
 
-// testToken — токен, который понимает поддельный сервер.
+// testToken - токен тестового Bot API.
 const testToken = "123:secret"
 
-// sentMessage — сообщение, полученное поддельным сервером.
+// sentMessage - сообщение, принятое fixture Bot API.
 type sentMessage struct {
 	ChatID string
 	Text   string
 	At     time.Time
 }
 
-// fakeAPI — поддельный Bot API на httptest.Server.
+// fakeAPI хранит ответы и запросы fixture Bot API.
 type fakeAPI struct {
-	mu             sync.Mutex
-	server         *httptest.Server
-	sent           []sentMessage
-	commands       map[string]string
-	updates        []string
-	sendStatuses   []string
-	unauthorized   bool
-	webhookDeleted bool
-	webhookStatus  string
-	webhookCalls   int
-	pollModes      []string
+	mu              sync.Mutex
+	client          *mock.MockHTTPClient
+	closed          bool
+	sent            []sentMessage
+	commands        map[string]string
+	callbackAnswers map[string]string
+	getMeCalls      int
+	updates         []string
+	sendStatuses    []string
+	unauthorized    bool
+	webhookDeleted  bool
+	webhookStatus   string
+	webhookCalls    int
+	pollModes       []string
 }
 
-// newFakeAPI запускает поддельный Bot API.
+// newFakeAPI создаёт fixture Bot API над HTTP-моком.
 func newFakeAPI(t *testing.T) *fakeAPI {
 	t.Helper()
 
-	f := &fakeAPI{commands: map[string]string{}}
-	f.server = httptest.NewServer(http.HandlerFunc(f.handle))
-	t.Cleanup(f.server.Close)
+	f := &fakeAPI{commands: map[string]string{}, callbackAnswers: map[string]string{}}
+	f.client = mock.NewMockHTTPClient(gomock.NewController(t))
+	f.client.EXPECT().Do(gomock.Any()).DoAndReturn(f.do).AnyTimes()
 
 	return f
 }
@@ -115,9 +123,23 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 
 	switch method {
 	case "getMe":
-		writeResult(w, `{"id":123,"is_bot":true,"first_name":"Home","username":"MyHomeBot"}`)
+		f.mu.Lock()
+
+		f.getMeCalls++
+
+		f.mu.Unlock()
+
+		writeResult(w, `{"id":123,"is_bot":true,"first_name":"Home","username":"MyHomeBot","active_usernames":["MyHomeBot","HomeAlias"],"can_join_groups":true,"can_read_all_group_messages":false,"supports_inline_queries":true,"inline_query_placeholder":"Search","has_topic_sidebar":true}`)
+	case "answerCallbackQuery":
+		f.mu.Lock()
+
+		f.callbackAnswers[r.FormValue("callback_query_id")] = r.FormValue("text") + ":" + r.FormValue("show_alert")
+
+		f.mu.Unlock()
+
+		writeResult(w, "true")
 	case "getUpdates":
-		f.handleGetUpdates(w)
+		f.handleGetUpdates(w, r)
 	case "deleteWebhook":
 		f.handleDeleteWebhook(w)
 	case "setMyCommands":
@@ -135,7 +157,7 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleDeleteWebhook отвечает на deleteWebhook заданным статусом ("" — успех, "429", "400").
+// handleDeleteWebhook отвечает на deleteWebhook заданным статусом ("" - успех, "429", "400").
 func (f *fakeAPI) handleDeleteWebhook(w http.ResponseWriter) {
 	f.mu.Lock()
 
@@ -158,7 +180,7 @@ func (f *fakeAPI) handleDeleteWebhook(w http.ResponseWriter) {
 	}
 }
 
-// setWebhookStatus задаёт ответ на deleteWebhook: "" — успех, "429", "400".
+// setWebhookStatus задаёт ответ на deleteWebhook: "" - успех, "429", "400".
 func (f *fakeAPI) setWebhookStatus(status string) {
 	f.mu.Lock()
 
@@ -175,8 +197,7 @@ func (f *fakeAPI) webhookCallCount() int {
 	return f.webhookCalls
 }
 
-// queuePollModes задаёт поведение следующих вызовов getUpdates: "drop" - оборвать соединение,
-// "429" - Too Many Requests; после очереди getUpdates отвечает как обычно.
+// queuePollModes задаёт сетевую ошибку или ответ 429 для следующих getUpdates.
 func (f *fakeAPI) queuePollModes(modes ...string) {
 	f.mu.Lock()
 
@@ -186,7 +207,7 @@ func (f *fakeAPI) queuePollModes(modes ...string) {
 }
 
 // handleGetUpdates отдаёт накопленные апдейты или пустой список после короткой паузы.
-func (f *fakeAPI) handleGetUpdates(w http.ResponseWriter) {
+func (f *fakeAPI) handleGetUpdates(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 
 	updates := f.updates
@@ -200,23 +221,18 @@ func (f *fakeAPI) handleGetUpdates(w http.ResponseWriter) {
 
 	f.mu.Unlock()
 
-	switch mode {
-	case "drop":
-		if hijacker, ok := w.(http.Hijacker); ok {
-			if conn, _, errHijack := hijacker.Hijack(); errHijack == nil {
-				_ = conn.Close()
-			}
-		}
-
-		return
-	case "429":
+	if mode == "429" {
 		writeError(w, 429, "Too Many Requests", 1)
 
 		return
 	}
 
 	if len(updates) == 0 {
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-time.After(50 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
 	}
 
 	writeResult(w, "["+strings.Join(updates, ",")+"]")
@@ -284,4 +300,63 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 
 	t.Fatalf("timeout waiting for %s", what)
+}
+
+// do отвечает на запрос HTTP-мока подготовленным результатом Bot API.
+func (f *fakeAPI) do(request *http.Request) (*http.Response, error) {
+	if request.Context().Err() != nil {
+		return nil, request.Context().Err()
+	}
+
+	f.mu.Lock()
+
+	closed := f.closed
+
+	drop := strings.HasSuffix(request.URL.Path, "/getUpdates") && len(f.pollModes) > 0 && f.pollModes[0] == "drop"
+	if drop {
+		f.pollModes = f.pollModes[1:]
+	}
+
+	f.mu.Unlock()
+
+	if closed || drop {
+		return nil, fmt.Errorf("Post %s: %w", request.URL, errors.New("connection lost"))
+	}
+
+	recorder := httptest.NewRecorder()
+	f.handle(recorder, request)
+
+	if request.Context().Err() != nil {
+		return nil, request.Context().Err()
+	}
+
+	return recorder.Result(), nil
+}
+
+// close заставляет HTTP-мок возвращать сетевую ошибку.
+func (f *fakeAPI) close() {
+	f.mu.Lock()
+
+	f.closed = true
+
+	f.mu.Unlock()
+}
+
+// newHTTPFixture создаёт HTTP-мок с проверкой запроса и записанным ответом.
+func newHTTPFixture(t *testing.T, handler http.HandlerFunc) *mock.MockHTTPClient {
+	t.Helper()
+
+	client := mock.NewMockHTTPClient(gomock.NewController(t))
+	client.EXPECT().Do(gomock.Any()).DoAndReturn(func(request *http.Request) (*http.Response, error) {
+		if request.Context().Err() != nil {
+			return nil, request.Context().Err()
+		}
+
+		recorder := httptest.NewRecorder()
+		handler(recorder, request)
+
+		return recorder.Result(), nil
+	}).AnyTimes()
+
+	return client
 }

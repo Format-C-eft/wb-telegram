@@ -2,614 +2,211 @@ package wbdevice
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"maps"
+	"slices"
 	"strconv"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
-	mqtt "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/packets"
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/wbdevice/mock"
 )
 
-// testControls возвращает набор контролов, как у бота: send и одна команда.
-func testControls() []Control {
-	return []Control{
-		{ID: "send", Meta: ControlMeta{Type: ControlTypeText, Title: map[string]string{"en": "Message", "ru": "Сообщение"}, Order: 1}},
-		{ID: "cmd_gate", Meta: ControlMeta{Type: ControlTypeText, Title: map[string]string{"en": "/gate", "ru": "Ворота"}, Order: 2, Readonly: true}, Initial: "{}", Volatile: true},
-	}
-}
-
-// startDevice создаёт и запускает устройство на тестовом брокере.
-func startDevice(t *testing.T, broker string, handler WriteHandler, controls ...Control) *Device {
-	t.Helper()
-
-	dev, errNew := New("telegram_bot",
-		WithBroker(broker),
-		WithClientID("dev-"+t.Name()),
-		WithTitle("Telegram Bot", "Telegram-бот"),
-		WithControls(controls...),
-		WithWriteHandler(handler),
-		WithStaleWindow(200*time.Millisecond),
-	)
-	if errNew != nil {
-		t.Fatalf("New: %v", errNew)
-	}
-
-	errRun := dev.Run(context.Background())
-	if errRun != nil {
-		t.Fatalf("Run: %v", errRun)
-	}
-
-	waitFor(t, "device connected", dev.Connected)
-	t.Cleanup(func() { _ = dev.Stop() })
-
-	return dev
-}
-
-// writeRecorder запоминает записи, полученные обработчиком WriteHandler.
-type writeRecorder struct {
-	mu  sync.Mutex
-	got []string
-}
-
-// handle — WriteHandler, сохраняющий запись в виде "control=payload".
-func (r *writeRecorder) handle(controlID string, payload []byte) {
-	r.mu.Lock()
-	r.got = append(r.got, controlID+"="+string(payload))
-	r.mu.Unlock()
-}
-
-// writes возвращает копию полученных записей.
-func (r *writeRecorder) writes() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return append([]string(nil), r.got...)
-}
-
-// TestDevicePublishesInitialState проверяет meta, пустые значения и снятие ошибки при подключении.
+// TestDevicePublishesInitialState проверяет WB metadata, placeholder и настройки MQTT.
 func TestDevicePublishesInitialState(t *testing.T) {
 	t.Parallel()
 
-	broker := startBroker(t)
-	obs := newObserver(t, broker, "/devices/telegram_bot/#")
-
-	obs.publish(t, "/devices/telegram_bot/controls/cmd_gate", `{"id":"old"}`, true)
-	startDevice(t, broker, nil, testControls()...)
-
-	waitFor(t, "device meta", func() bool {
-		_, ok := obs.get("/devices/telegram_bot/meta")
-
-		return ok
-	})
-
-	meta, _ := obs.get("/devices/telegram_bot/meta")
-
-	var gotMeta map[string]any
-
-	_ = json.Unmarshal([]byte(meta), &gotMeta)
-
-	title, _ := gotMeta["title"].(map[string]any)
-	if gotMeta["driver"] != "wb-telegram" || title["ru"] != "Telegram-бот" {
-		t.Fatalf("device meta = %s", meta)
+	dev, client, configured, controller := newMockDevice(t)
+	if configured.WillTopic != deviceErrorTopic(dev.id) || string(configured.WillPayload) != ErrorFlagRead || configured.WillQos != 1 || !configured.WillRetained || !configured.AutoReconnect || !configured.ConnectRetry || !configured.CleanSession {
+		t.Fatalf("MQTT options = %+v", configured)
 	}
 
-	waitFor(t, "control meta", func() bool {
-		value, ok := obs.get("/devices/telegram_bot/controls/cmd_gate/meta")
+	client.EXPECT().IsConnectionOpen().Return(true).AnyTimes()
+	expectState(client, controller, "", "{}", "")
+	expectCollection(client, controller, "/devices/telegram_bot/controls/#")
+	expectWrites(client, controller)
+	expectPublish(client, controller, deviceErrorTopic(dev.id), "")
+	configured.OnConnect(client)
 
-		return ok && value == `{"type":"text","title":{"en":"/gate","ru":"Ворота"},"order":2,"readonly":true}`
-	})
+	if !dev.Connected() {
+		t.Fatal("device is not ready after metadata and subscriptions")
+	}
 
-	waitFor(t, "stale command value replaced by placeholder", func() bool {
-		value, ok := obs.get("/devices/telegram_bot/controls/cmd_gate")
-
-		return ok && value == "{}"
-	})
-
-	waitFor(t, "device error cleared", func() bool {
-		value, ok := obs.get("/devices/telegram_bot/meta/error")
-
-		return ok && value == ""
-	})
+	runDevice(t, dev, client, controller)
 }
 
-// TestDeviceWriteHandler проверяет доставку записей в /on только для записываемых контролов.
-func TestDeviceWriteHandler(t *testing.T) {
-	t.Parallel()
-
-	broker := startBroker(t)
-	recorder := &writeRecorder{}
-
-	startDevice(t, broker, recorder.handle, testControls()...)
-
-	obs := newObserver(t, broker, "/devices/telegram_bot/#")
-	obs.publish(t, "/devices/telegram_bot/controls/cmd_gate/on", "hack", false)
-	obs.publish(t, "/devices/telegram_bot/controls/send/on", "Привет", false)
-
-	waitFor(t, "write delivered", func() bool {
-		return len(recorder.writes()) > 0
-	})
-
-	time.Sleep(200 * time.Millisecond)
-
-	got := recorder.writes()
-	if len(got) != 1 || got[0] != "send=Привет" {
-		t.Fatalf("writes = %v", got)
-	}
-}
-
-// TestDeviceSetValueAndError проверяет публикацию значения и флага ошибки контрола.
-func TestDeviceSetValueAndError(t *testing.T) {
-	t.Parallel()
-
-	broker := startBroker(t)
-	dev := startDevice(t, broker, nil, testControls()...)
-	obs := newObserver(t, broker, "/devices/telegram_bot/#")
-
-	waitForRetained(t, obs, "/devices/telegram_bot/meta")
-
-	errValue := dev.SetValue(t.Context(), "cmd_gate", `{"id":"1"}`)
-	if errValue != nil {
-		t.Fatalf("SetValue: %v", errValue)
-	}
-
-	errError := dev.SetError(t.Context(), "send", ErrorFlagWrite)
-	if errError != nil {
-		t.Fatalf("SetError: %v", errError)
-	}
-
-	waitFor(t, "value and error", func() bool {
-		value, _ := obs.get("/devices/telegram_bot/controls/cmd_gate")
-		flags, _ := obs.get("/devices/telegram_bot/controls/send/meta/error")
-
-		return value == `{"id":"1"}` && flags == "w"
-	})
-
-	errUnknown := dev.SetValue(t.Context(), "nope", "x")
-	if !errors.Is(errUnknown, ErrUnknownControl) {
-		t.Fatalf("SetValue(nope) = %v, want ErrUnknownControl", errUnknown)
-	}
-}
-
-// TestDeviceReconnect проверяет, что после обрыва связи устройство заново публикует состояние и подписку на /on:
-// обычный контрол — с последним значением, Volatile-контрол (вызов команды) — с заглушкой Initial, чтобы вызов не повторился.
+// TestDeviceReconnect проверяет повторное состояние и сброс временного значения.
 func TestDeviceReconnect(t *testing.T) {
 	t.Parallel()
 
-	srv, broker := startBrokerServer(t)
-	recorder := &writeRecorder{}
-	dev := startDevice(t, broker, recorder.handle, testControls()...)
-	obs := newObserver(t, broker, "/devices/telegram_bot/#")
+	var events []bool
 
-	waitForRetained(t, obs, "/devices/telegram_bot/meta")
+	dev, client, configured, controller := newMockDevice(t, WithOnConnection(func(ok bool) { events = append(events, ok) }))
+	client.EXPECT().IsConnectionOpen().Return(true).AnyTimes()
+	expectState(client, controller, "", "{}", "")
+	expectCollection(client, controller, "/devices/telegram_bot/controls/#")
+	expectWrites(client, controller)
+	expectPublish(client, controller, deviceErrorTopic(dev.id), "")
+	configured.OnConnect(client)
 
-	errValue := dev.SetValue(t.Context(), "cmd_gate", `{"id":"7"}`)
-	if errValue != nil {
-		t.Fatalf("SetValue: %v", errValue)
+	expectPublish(client, controller, controlTopic(dev.id, "send"), "saved")
+	expectPublish(client, controller, controlTopic(dev.id, "cmd_gate"), `{"id":"7"}`)
+	expectPublish(client, controller, controlErrorTopic(dev.id, "send"), ErrorFlagWrite)
+
+	if errValue := dev.SetValue(t.Context(), "send", "saved"); errValue != nil {
+		t.Fatal(errValue)
 	}
 
-	errSend := dev.SetValue(t.Context(), "send", "привет")
-	if errSend != nil {
-		t.Fatalf("SetValue send: %v", errSend)
+	if errCommand := dev.SetValue(t.Context(), "cmd_gate", `{"id":"7"}`); errCommand != nil {
+		t.Fatal(errCommand)
 	}
 
-	waitFor(t, "values before reconnect", func() bool {
-		value, _ := obs.get("/devices/telegram_bot/controls/cmd_gate")
-		text, _ := obs.get("/devices/telegram_bot/controls/send")
-
-		return value == `{"id":"7"}` && text == "привет"
-	})
-
-	metaCount := obs.count("/devices/telegram_bot/meta")
-	errorCount := obs.count("/devices/telegram_bot/meta/error")
-	valueCount := obs.count("/devices/telegram_bot/controls/cmd_gate")
-	sendCount := obs.count("/devices/telegram_bot/controls/send")
-
-	client, ok := srv.Clients.Get("dev-" + t.Name())
-	if !ok {
-		t.Fatal("device client not found on broker")
+	if errFlags := dev.SetError(t.Context(), "send", ErrorFlagWrite); errFlags != nil {
+		t.Fatal(errFlags)
 	}
 
-	client.Stop(errors.New("test: connection dropped"))
+	configured.OnReconnecting(client, configured)
 
-	waitFor(t, "device meta republished", func() bool {
-		return obs.count("/devices/telegram_bot/meta") > metaCount
-	})
-
-	waitFor(t, "device error cleared again", func() bool {
-		value, _ := obs.get("/devices/telegram_bot/meta/error")
-
-		return obs.count("/devices/telegram_bot/meta/error") > errorCount && value == ""
-	})
-
-	waitFor(t, "command value republished as placeholder", func() bool {
-		value, _ := obs.get("/devices/telegram_bot/controls/cmd_gate")
-
-		return obs.count("/devices/telegram_bot/controls/cmd_gate") > valueCount && value == "{}"
-	})
-
-	waitFor(t, "send value republished", func() bool {
-		text, _ := obs.get("/devices/telegram_bot/controls/send")
-
-		return obs.count("/devices/telegram_bot/controls/send") > sendCount && text == "привет"
-	})
-
-	waitFor(t, "device ready after reconnect", dev.Connected)
-
-	obs.publish(t, "/devices/telegram_bot/controls/send/on", "после переподключения", false)
-
-	waitFor(t, "write after reconnect", func() bool {
-		got := recorder.writes()
-
-		return len(got) == 1 && got[0] == "send=после переподключения"
-	})
-}
-
-// TestDeviceHandlerCanSetValue проверяет, что обработчик записи может вызывать SetValue
-// без блокировки приёма подтверждений от брокера, даже когда записи идут подряд.
-func TestDeviceHandlerCanSetValue(t *testing.T) {
-	t.Parallel()
-
-	broker := startBroker(t)
-
-	var (
-		current  atomic.Pointer[Device]
-		handled  atomic.Int64
-		failures atomic.Int64
-	)
-
-	handler := func(controlID string, payload []byte) {
-		errSet := current.Load().SetValue(t.Context(), controlID, string(payload))
-		if errSet != nil {
-			failures.Add(1)
-		}
-
-		handled.Add(1)
+	if dev.Connected() {
+		t.Fatal("device stayed ready while reconnecting")
 	}
 
-	dev, errNew := New("telegram_bot", WithBroker(broker), WithClientID("dev-"+t.Name()),
-		WithControls(testControls()...), WithWriteHandler(handler))
-	if errNew != nil {
-		t.Fatalf("New: %v", errNew)
-	}
+	expectState(client, controller, "saved", "{}", ErrorFlagWrite)
+	expectWrites(client, controller)
+	expectPublish(client, controller, deviceErrorTopic(dev.id), "")
+	configured.OnConnect(client)
+	configured.OnConnectionLost(client, errors.New("previous connection"))
 
-	current.Store(dev)
-
-	errRun := dev.Run(context.Background())
-	if errRun != nil {
-		t.Fatalf("Run: %v", errRun)
-	}
-
-	t.Cleanup(func() { _ = dev.Stop() })
-
-	waitFor(t, "device connected", dev.Connected)
-
-	obs := newObserver(t, broker, "/devices/telegram_bot/controls/send/on")
-	started := time.Now()
-
-	const total = 10
-
-	tokens := make([]paho.Token, 0, total)
-
-	for i := range total {
-		tokens = append(tokens, obs.client.Publish("/devices/telegram_bot/controls/send/on", 1, false, "msg-"+strconv.Itoa(i)))
-	}
-
-	for _, token := range tokens {
-		if !token.WaitTimeout(5*time.Second) || token.Error() != nil {
-			t.Fatalf("publish: %v", token.Error())
-		}
-	}
-
-	waitFor(t, "all writes handled", func() bool {
-		return handled.Load() == total
-	})
-
-	// Без отдельной горутины обработчика каждый SetValue ждал бы таймаут 10 с.
-	if elapsed := time.Since(started); elapsed > 5*time.Second {
-		t.Fatalf("writes took %v", elapsed)
-	}
-
-	if failures.Load() != 0 {
-		t.Fatalf("SetValue failed %d times", failures.Load())
+	if !dev.Connected() || !slices.Equal(events, []bool{true, false, true}) {
+		t.Fatalf("ready = %v, events = %v", dev.Connected(), events)
 	}
 }
 
-// TestDeviceSetValueFailureNotReplayed проверяет, что значение, которое не удалось опубликовать,
-// не публикуется позже при подключении: о неудаче команды уже сообщили.
+// TestDeviceSetValueFailureNotReplayed проверяет откат недоставленного значения.
 func TestDeviceSetValueFailureNotReplayed(t *testing.T) {
 	t.Parallel()
 
-	broker := startBroker(t)
-	obs := newObserver(t, broker, "/devices/telegram_bot/#")
+	dev, client, _, controller := newMockDevice(t)
+	client.EXPECT().IsConnectionOpen().Return(false)
 
-	dev, errNew := New("telegram_bot", WithBroker(broker), WithClientID("dev-"+t.Name()), WithControls(testControls()...))
-	if errNew != nil {
-		t.Fatalf("New: %v", errNew)
-	}
-
-	t.Cleanup(func() { _ = dev.Stop() })
-
-	errValue := dev.SetValue(t.Context(), "cmd_gate", `{"id":"failed"}`)
+	errValue := dev.SetValue(t.Context(), "cmd_gate", "failed")
 	if !errors.Is(errValue, ErrNotConnected) {
-		t.Fatalf("SetValue before connect = %v, want ErrNotConnected", errValue)
+		t.Fatalf("SetValue = %v", errValue)
 	}
 
-	errRun := dev.Run(context.Background())
-	if errRun != nil {
-		t.Fatalf("Run: %v", errRun)
+	client.EXPECT().IsConnectionOpen().Return(true).AnyTimes()
+	expectState(client, controller, "", "{}", "")
+
+	if errState := dev.publishState(); errState != nil {
+		t.Fatal(errState)
 	}
 
-	waitFor(t, "device connected", dev.Connected)
-	waitFor(t, "command value published", func() bool {
-		return obs.count("/devices/telegram_bot/controls/cmd_gate") > 0
-	})
+	if errUnknown := dev.SetError(t.Context(), "missing", "w"); !errors.Is(errUnknown, ErrUnknownControl) {
+		t.Fatalf("SetError = %v", errUnknown)
+	}
 
-	if value, _ := obs.get("/devices/telegram_bot/controls/cmd_gate"); value != "{}" {
-		t.Fatalf("value after connect = %q, want placeholder {}", value)
+	if errUnknownValue := dev.SetValue(t.Context(), "missing", "x"); !errors.Is(errUnknownValue, ErrUnknownControl) {
+		t.Fatalf("SetValue = %v", errUnknownValue)
 	}
 }
 
-// TestDeviceEmptyValueNotPublished проверяет, что пустое значение контрола не публикуется:
-// пустое retained-сообщение удаляет значение, и wb-rules счёл бы контрол удалённым.
-func TestDeviceEmptyValueNotPublished(t *testing.T) {
+// TestDeviceWriteHandler проверяет фильтрацию, копирование payload и очередь записей.
+func TestDeviceWriteHandler(t *testing.T) {
 	t.Parallel()
 
-	broker := startBroker(t)
-	obs := newObserver(t, broker, "/devices/telegram_bot/#")
+	delivered := make(chan string, 1)
+	dev, client, _, controller := newMockDevice(t, WithWriteHandler(func(id string, payload []byte) { delivered <- id + "=" + string(payload) }))
+	topic := controlOnTopic(dev.id, "send")
 
-	startDevice(t, broker, nil, testControls()...)
+	var handler paho.MessageHandler
 
-	waitFor(t, "send meta published", func() bool {
-		_, ok := obs.get("/devices/telegram_bot/controls/send/meta")
+	client.EXPECT().Subscribe(topic, byte(1), gomock.Any()).Do(func(_ string, _ byte, callback paho.MessageHandler) {
+		handler = callback
+	}).Return(subscribedToken(controller, topic, 1))
 
-		return ok
-	})
-
-	waitFor(t, "command placeholder published", func() bool {
-		value, _ := obs.get("/devices/telegram_bot/controls/cmd_gate")
-
-		return value == "{}"
-	})
-
-	if count := obs.count("/devices/telegram_bot/controls/send"); count != 0 {
-		t.Fatalf("send value published %d times, want none while it is empty", count)
-	}
-}
-
-// rejectOnceHook — хук брокера, один раз молча отбрасывающий публикацию в topic (без PUBACK).
-type rejectOnceHook struct {
-	mqtt.HookBase
-	topic    string
-	rejected atomic.Bool
-}
-
-// ID возвращает имя хука.
-func (h *rejectOnceHook) ID() string {
-	return "reject-once"
-}
-
-// Provides сообщает, что хук обрабатывает OnPublish.
-func (h *rejectOnceHook) Provides(b byte) bool {
-	return b == mqtt.OnPublish
-}
-
-// OnPublish отбрасывает первую публикацию в topic.
-func (h *rejectOnceHook) OnPublish(_ *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
-	if pk.TopicName == h.topic && h.rejected.CompareAndSwap(false, true) {
-		return pk, packets.ErrRejectPacket
+	if errSubscribe := dev.subscribeWrites(); errSubscribe != nil {
+		t.Fatal(errSubscribe)
 	}
 
-	return pk, nil
-}
+	handler(client, mockMessage(controller, topic, []byte("old"), true))
+	handler(client, mockMessage(controller, "/devices/other/controls/send/on", []byte("foreign"), false))
 
-// TestDeviceRetriesSetup проверяет повтор публикации состояния, если брокер не подтвердил её,
-// а соединение осталось открытым.
-func TestDeviceRetriesSetup(t *testing.T) {
-	t.Parallel()
+	payload := []byte("fresh")
+	handler(client, mockMessage(controller, topic, payload, false))
+	payload[0] = 'X'
 
-	hook := &rejectOnceHook{topic: "/devices/telegram_bot/meta/error"}
-	_, broker := startBrokerServer(t, hook)
-	obs := newObserver(t, broker, "/devices/telegram_bot/meta/error")
-
-	dev, errNew := New("telegram_bot", WithBroker(broker), WithClientID("dev-"+t.Name()),
-		WithControls(testControls()...), WithTimeout(200*time.Millisecond))
-	if errNew != nil {
-		t.Fatalf("New: %v", errNew)
-	}
-
-	t.Cleanup(func() { _ = dev.Stop() })
-
-	errRun := dev.Run(context.Background())
-	if errRun != nil {
-		t.Fatalf("Run: %v", errRun)
-	}
-
-	waitFor(t, "device ready after retry", dev.Connected)
-
-	if !hook.rejected.Load() {
-		t.Fatal("first meta/error publish was not rejected")
-	}
-
-	waitFor(t, "device error cleared", func() bool {
-		value, ok := obs.get("/devices/telegram_bot/meta/error")
-
-		return ok && value == ""
-	})
-}
-
-// TestDeviceShutdownHonorsContext проверяет, что Shutdown не ждёт брокер дольше дедлайна ctx
-// (с учётом минимума shutdownPublishFloor на публикацию r).
-func TestDeviceShutdownHonorsContext(t *testing.T) {
-	t.Parallel()
-
-	hook := &rejectOnceHook{topic: "/devices/telegram_bot/meta/error"}
-	srv, broker := startBrokerServer(t)
-	dev := startDevice(t, broker, nil, testControls()...)
-
-	errHook := srv.AddHook(hook, nil)
-	if errHook != nil {
-		t.Fatalf("AddHook: %v", errHook)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	started := time.Now()
-
-	errShutdown := dev.Shutdown(ctx)
-	if !errors.Is(errShutdown, ErrTimeout) {
-		t.Fatalf("Shutdown = %v, want ErrTimeout", errShutdown)
-	}
-
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("Shutdown took %v", elapsed)
-	}
-}
-
-// TestDeviceWill проверяет, что устройство регистрирует LWT: retained meta/error = r.
-// Проверяется will из пакета CONNECT, принятого брокером, — так тест не зависит от того,
-// как и когда брокер обрабатывает обрыв.
-func TestDeviceWill(t *testing.T) {
-	t.Parallel()
-
-	srv, broker := startBrokerServer(t)
-	startDevice(t, broker, nil, testControls()...)
-
-	client, ok := srv.Clients.Get("dev-" + t.Name())
-	if !ok {
-		t.Fatal("device client not found on broker")
-	}
-
-	will := client.Properties.Will
-	if will.TopicName != "/devices/telegram_bot/meta/error" || string(will.Payload) != ErrorFlagRead ||
-		!will.Retain || will.Qos != 1 {
-		t.Fatalf("will = topic %q payload %q retain %v qos %d", will.TopicName, will.Payload, will.Retain, will.Qos)
-	}
-}
-
-// TestDeviceRunWaitsReady проверяет, что Run возвращается уже готовым устройством и что пустой
-// meta/error (сигнал «устройство работает») публикуется только когда записи в /on уже принимаются:
-// запись, отправленная сразу по этому сигналу, доходит до обработчика.
-func TestDeviceRunWaitsReady(t *testing.T) {
-	t.Parallel()
-
-	broker := startBroker(t)
-	recorder := &writeRecorder{}
-	obs := newObserver(t, broker, seedFilter)
-
-	cleared := make(chan struct{})
-
-	var clearedOnce sync.Once
-
-	sub := obs.client.Subscribe("/devices/telegram_bot/meta/error", 1, func(_ paho.Client, m paho.Message) {
-		if len(m.Payload()) == 0 {
-			clearedOnce.Do(func() { close(cleared) })
-		}
-	})
-	if !sub.WaitTimeout(5*time.Second) || sub.Error() != nil {
-		t.Fatalf("subscribe: %v", sub.Error())
-	}
-
-	dev, errNew := New("telegram_bot", WithBroker(broker), WithClientID("dev-"+t.Name()),
-		WithControls(testControls()...), WithWriteHandler(recorder.handle), WithStaleWindow(500*time.Millisecond))
-	if errNew != nil {
-		t.Fatalf("New: %v", errNew)
-	}
-
-	t.Cleanup(func() { _ = dev.Stop() })
-
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- dev.Run(context.Background()) }()
+	dev.workers.Add(1)
+	go dev.dispatchWrites()
 
 	select {
-	case <-cleared:
-	case <-time.After(10 * time.Second):
-		t.Fatal("meta/error was not cleared")
+	case got := <-delivered:
+		if got != "send=fresh" {
+			t.Fatalf("write = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write not delivered")
 	}
 
-	obs.publish(t, "/devices/telegram_bot/controls/send/on", "сразу", false)
+	dev.stopOnce.Do(func() { close(dev.stop) })
+	dev.workers.Wait()
+	handler(client, mockMessage(controller, topic, []byte("stopped"), false))
+
+	if len(dev.writes) != 0 {
+		t.Fatal("write enqueued after stop")
+	}
+}
+
+// TestDeviceWriteQueueFull проверяет неблокирующий приём переполненной очереди.
+func TestDeviceWriteQueueFull(t *testing.T) {
+	t.Parallel()
+
+	dev, client, _, controller := newMockDevice(t, WithWriteHandler(func(string, []byte) {}))
+	for range writeQueueSize + 1 {
+		dev.handleWrite(client, mockMessage(controller, controlOnTopic(dev.id, "send"), []byte("x"), false))
+	}
+
+	if len(dev.writes) != writeQueueSize {
+		t.Fatalf("queue size = %d", len(dev.writes))
+	}
+}
+
+// TestDeviceHandlerCanSetValue проверяет публикацию из обработчика очереди.
+func TestDeviceHandlerCanSetValue(t *testing.T) {
+	t.Parallel()
+
+	var dev *Device
+
+	result := make(chan error, 1)
+	handler := func(id string, payload []byte) { result <- dev.SetValue(context.Background(), id, string(payload)) }
+
+	var (
+		client     *mock.MockClient
+		controller *gomock.Controller
+	)
+
+	dev, client, _, controller = newMockDevice(t, WithWriteHandler(handler))
+	client.EXPECT().IsConnectionOpen().Return(true)
+	expectPublish(client, controller, controlTopic(dev.id, "send"), "reply")
+
+	dev.workers.Add(1)
+	go dev.dispatchWrites()
+
+	dev.handleWrite(client, mockMessage(controller, controlOnTopic(dev.id, "send"), []byte("reply"), false))
 
 	select {
-	case errRun := <-runDone:
-		if errRun != nil {
-			t.Fatalf("Run: %v", errRun)
+	case errHandler := <-result:
+		if errHandler != nil {
+			t.Fatal(errHandler)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("Run did not return")
-	}
-
-	if !dev.Connected() {
-		t.Fatal("device is not ready after Run")
-	}
-
-	waitFor(t, "write right after meta/error cleared", func() bool {
-		got := recorder.writes()
-
-		return len(got) == 1 && got[0] == "send=сразу"
-	})
-}
-
-// TestDeviceShutdownExpiredContext проверяет, что Shutdown с уже истёкшим ctx всё равно
-// публикует meta/error = r (за отведённый минимум времени) и не возвращает ошибку.
-func TestDeviceShutdownExpiredContext(t *testing.T) {
-	t.Parallel()
-
-	broker := startBroker(t)
-	dev := startDevice(t, broker, nil, testControls()...)
-	obs := newObserver(t, broker, "/devices/telegram_bot/meta/error")
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
-	defer cancel()
-
-	<-ctx.Done()
-
-	errShutdown := dev.Shutdown(ctx)
-	if errShutdown != nil {
-		t.Fatalf("Shutdown: %v", errShutdown)
-	}
-
-	waitFor(t, "error flag r", func() bool {
-		value, _ := obs.get("/devices/telegram_bot/meta/error")
-
-		return value == ErrorFlagRead
-	})
-}
-
-// TestDeviceShutdownMarksError проверяет, что при остановке выставляется meta/error = r.
-func TestDeviceShutdownMarksError(t *testing.T) {
-	t.Parallel()
-
-	broker := startBroker(t)
-	dev := startDevice(t, broker, nil, testControls()...)
-	obs := newObserver(t, broker, "/devices/telegram_bot/meta/error")
-
-	errShutdown := dev.Shutdown(context.Background())
-	if errShutdown != nil {
-		t.Fatalf("Shutdown: %v", errShutdown)
-	}
-
-	waitFor(t, "error flag r", func() bool {
-		value, _ := obs.get("/devices/telegram_bot/meta/error")
-
-		return value == ErrorFlagRead
-	})
-
-	if dev.Connected() {
-		t.Fatal("device must be disconnected after Shutdown")
-	}
-
-	if errValue := dev.SetValue(t.Context(), "send", "x"); !errors.Is(errValue, ErrNotConnected) {
-		t.Fatalf("SetValue after shutdown = %v, want ErrNotConnected", errValue)
+	case <-time.After(time.Second):
+		t.Fatal("handler blocked")
 	}
 }
 
-// TestNewValidates проверяет отказ на некорректных идентификаторах и опциях.
+// TestNewValidates проверяет идентификаторы и обязательные опции.
 func TestNewValidates(t *testing.T) {
 	t.Parallel()
 
@@ -618,20 +215,93 @@ func TestNewValidates(t *testing.T) {
 		deviceID string
 		opts     []Option
 	}{
-		{name: "bad device id", deviceID: "Telegram-Bot"},
-		{name: "bad control id", deviceID: "telegram_bot", opts: []Option{WithControls(Control{ID: "cmd/gate", Meta: ControlMeta{Type: ControlTypeText}})}},
-		{name: "duplicate control", deviceID: "telegram_bot", opts: []Option{WithControls(testControls()[0], testControls()[0])}},
-		{name: "empty broker", deviceID: "telegram_bot", opts: []Option{WithBroker("")}},
+		{name: "device", deviceID: "Telegram-Bot"},
+		{name: "control", deviceID: "telegram_bot", opts: []Option{WithControls(Control{ID: "cmd/gate"})}},
+		{name: "duplicate", deviceID: "telegram_bot", opts: []Option{WithControls(testControls()[0], testControls()[0])}},
+		{name: "broker", deviceID: "telegram_bot", opts: []Option{WithBroker("")}},
+		{name: "client", deviceID: "telegram_bot", opts: []Option{WithClientID("")}},
+		{name: "driver", deviceID: "telegram_bot", opts: []Option{WithDriver("")}},
+		{name: "handler", deviceID: "telegram_bot", opts: []Option{WithOnConnection(nil)}},
+		{name: "timeout", deviceID: "telegram_bot", opts: []Option{WithTimeout(0)}},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
 			_, errNew := New(tt.deviceID, tt.opts...)
 			if !errors.Is(errNew, ErrInvalidArgument) {
-				t.Fatalf("New error = %v, want ErrInvalidArgument", errNew)
+				t.Fatalf("New = %v", errNew)
 			}
 		})
+	}
+}
+
+// TestDeviceSubscribesBeforeHealthy проверяет порядок готовности устройства.
+func TestDeviceSubscribesBeforeHealthy(t *testing.T) {
+	t.Parallel()
+
+	dev, client, configured, controller := newMockDevice(t)
+	client.EXPECT().IsConnectionOpen().Return(true).AnyTimes()
+	expectState(client, controller, "", "{}", "")
+
+	filter := "/devices/telegram_bot/controls/#"
+	subscribe := client.EXPECT().Subscribe(filter, byte(1), gomock.Any()).Return(subscribedToken(controller, filter, 1))
+	unsubscribe := client.EXPECT().Unsubscribe(filter).Return(completedToken(controller)).After(subscribe)
+	topic := controlOnTopic(dev.id, "send")
+	writes := client.EXPECT().Subscribe(topic, byte(1), gomock.Any()).Return(subscribedToken(controller, topic, 1)).After(unsubscribe)
+	healthy := expectPublish(client, controller, deviceErrorTopic(dev.id), "").After(writes)
+	healthy.Do(func(string, byte, bool, any) {
+		if dev.Connected() {
+			t.Error("device ready before healthy PUBACK")
+		}
+	})
+	configured.OnConnect(client)
+
+	if !maps.Equal(dev.values, map[string]string{"send": "", "cmd_gate": "{}"}) {
+		t.Fatalf("values = %v", dev.values)
+	}
+}
+
+// TestClientFactoryIsLocal проверяет изоляцию фабрик отдельных устройств.
+func TestClientFactoryIsLocal(t *testing.T) {
+	t.Parallel()
+
+	first, firstClient, _, _ := newMockDevice(t)
+
+	second, secondClient, _, _ := newMockDevice(t)
+	if first.client != firstClient || second.client != secondClient || first.client == second.client {
+		t.Fatal("device clients are shared")
+	}
+
+	var _ paho.Client = firstClient
+}
+
+// TestDeviceWriteOrder проверяет последовательную доставку очереди обработчику.
+func TestDeviceWriteOrder(t *testing.T) {
+	t.Parallel()
+
+	const count = 10
+
+	delivered := make(chan string, count)
+
+	dev, client, _, controller := newMockDevice(t, WithWriteHandler(func(_ string, payload []byte) {
+		delivered <- string(payload)
+	}))
+	for index := range count {
+		dev.handleWrite(client, mockMessage(controller, controlOnTopic(dev.id, "send"), []byte(strconv.Itoa(index)), false))
+	}
+
+	dev.workers.Add(1)
+	go dev.dispatchWrites()
+
+	for index := range count {
+		select {
+		case got := <-delivered:
+			if got != strconv.Itoa(index) {
+				t.Fatalf("write %d = %q", index, got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("queue delivery stopped")
+		}
 	}
 }

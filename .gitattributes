@@ -1,0 +1,2 @@
+*.sum -diff
+**/*_mock.go -diff -text
