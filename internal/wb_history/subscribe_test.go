@@ -2,155 +2,118 @@ package wb_history
 
 import (
 	"context"
-	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	mqtt "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/packets"
+	paho "github.com/eclipse/paho.mqtt.golang"
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/wb_history/mock"
 )
 
-// TestBrokerAddressAliases проверяет адреса MQTT с tcp и без явной схемы.
+// TestBrokerAddressAliases проверяет передачу адресов MQTT без изменения схемы.
 func TestBrokerAddressAliases(t *testing.T) {
 	t.Parallel()
 
-	_, broker := localBrokerServer(t)
-	address := strings.TrimPrefix(broker, "tcp://")
-
-	for _, prefix := range []string{"", "mqtt://"} {
-		t.Run(prefix+address, func(t *testing.T) {
+	for _, broker := range []string{"127.0.0.1:1883", "mqtt://127.0.0.1:1883"} {
+		t.Run(broker, func(t *testing.T) {
 			t.Parallel()
 
-			client, errNew := New(WithBroker(prefix + address))
-			if errNew != nil {
-				t.Fatal(errNew)
+			fixture := newHistoryFixture(t, WithBroker(broker))
+			if len(fixture.config.Servers) != 1 || fixture.config.Servers[0].Host != "127.0.0.1:1883" {
+				t.Fatalf("servers=%v", fixture.config.Servers)
 			}
 
-			t.Cleanup(func() { _ = client.Stop() })
-
-			errRun := client.Run(t.Context())
-			if errRun != nil {
-				t.Fatal(errRun)
-			}
-
-			awaitReady(t, client)
+			fixture.run(t)
 		})
 	}
 }
 
-// subscribeFault отказывает в первом SUBACK без потери соединения.
-type subscribeFault struct {
-	mqtt.HookBase
-	attempts atomic.Int64
-	connects atomic.Int64
-	always   bool
-	first    chan struct{}
-}
-
-// ID возвращает имя тестового хука.
-func (*subscribeFault) ID() string { return "subscribe-fault" }
-
-// Provides задаёт события тестового хука.
-func (*subscribeFault) Provides(event byte) bool {
-	return event == mqtt.OnConnect || event == mqtt.OnSubscribed
-}
-
-// OnConnect считает подключения клиента.
-func (fault *subscribeFault) OnConnect(_ *mqtt.Client, _ packets.Packet) error {
-	fault.connects.Add(1)
-
-	return nil
-}
-
-// OnSubscribed заменяет первый успешный SUBACK явным отказом.
-func (fault *subscribeFault) OnSubscribed(_ *mqtt.Client, _ packets.Packet, codes []byte) {
-	attempt := fault.attempts.Add(1)
-	if attempt == 1 || fault.always {
-		codes[0] = 0x80
-	}
-
-	if attempt == 1 {
-		close(fault.first)
-	}
-}
-
-// retryClient создаёт клиент с ошибкой первого подтверждения подписки.
-func retryClient(t *testing.T, always bool) (*Client, *subscribeFault) {
+// retryClient создаёт клиент с отказом первого SUBACK.
+func retryClient(t *testing.T, retry bool) (*historyFixture, <-chan struct{}) {
 	t.Helper()
 
-	server, broker := localBrokerServer(t)
-	fault := &subscribeFault{always: always, first: make(chan struct{})}
+	fixture := newHistoryFixture(t)
+	fixture.mqtt.EXPECT().Connect().Return(completedToken(fixture.ctrl, nil))
+	fixture.mqtt.EXPECT().IsConnectionOpen().Return(true).AnyTimes()
 
-	errHook := server.AddHook(fault, nil)
-	if errHook != nil {
-		t.Fatal(errHook)
+	first := make(chan struct{})
+	failed := mock.NewMockSubscriptionToken(fixture.ctrl)
+	ack := make(chan struct{})
+	close(ack)
+	failed.EXPECT().Done().Return(ack)
+	failed.EXPECT().Error().Return(nil)
+	failed.EXPECT().Result().DoAndReturn(func() map[string]byte {
+		close(first)
+
+		return map[string]byte{fixture.client.topic + "/reply": 0x80}
+	})
+	fixture.mqtt.EXPECT().Subscribe(fixture.client.topic+"/reply", byte(1), gomock.Any()).DoAndReturn(func(_ string, _ byte, handler paho.MessageHandler) paho.Token {
+		fixture.handler = handler
+
+		return failed
+	})
+
+	if retry {
+		fixture.expectSubscribe(fixture.subscription(1))
 	}
 
-	client, errNew := New(WithBroker(broker))
-	if errNew != nil {
-		t.Fatal(errNew)
-	}
-
-	t.Cleanup(func() { _ = client.Stop() })
-
-	errRun := client.Run(context.Background())
+	errRun := fixture.client.Run(context.Background())
 	if errRun != nil {
 		t.Fatal(errRun)
 	}
 
-	select {
-	case <-fault.first:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first SUBACK missing")
-	}
+	done := make(chan struct{})
 
-	return client, fault
+	go func() { fixture.config.OnConnect(fixture.mqtt); close(done) }()
+
+	<-first
+
+	return fixture, done
 }
 
 // TestSubscribeRetry проверяет повтор подписки после отказа без переподключения.
 func TestSubscribeRetry(t *testing.T) {
 	t.Parallel()
 
-	client, fault := retryClient(t, false)
-	awaitReady(t, client)
+	fixture, done := retryClient(t, true)
 
-	if fault.connects.Load() != 1 || fault.attempts.Load() != 2 {
-		t.Fatalf("connects=%d subscriptions=%d", fault.connects.Load(), fault.attempts.Load())
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SUBACK retry did not finish")
+	}
+
+	if !fixture.client.Ready() {
+		t.Fatal("retry did not restore ready")
 	}
 }
 
-// TestSubscribeRetryStop проверяет завершение setup при остановке в паузе повтора.
+// TestSubscribeRetryStop проверяет остановку в паузе повтора подписки.
 func TestSubscribeRetryStop(t *testing.T) {
 	t.Parallel()
 
-	client, fault := retryClient(t, true)
+	fixture, done := retryClient(t, false)
 	started := time.Now()
 
-	errStop := client.Stop()
+	errStop := fixture.client.Stop()
 	if errStop != nil {
 		t.Fatal(errStop)
 	}
 
-	if time.Since(started) > time.Second {
-		t.Fatal("Stop waited for retry timeout")
-	}
+	<-done
 
-	if client.Ready() || fault.attempts.Load() != 1 || fault.connects.Load() != 1 {
-		t.Fatal("subscription retried after Stop")
+	if time.Since(started) > time.Second || fixture.client.Ready() {
+		t.Fatal("Stop waited for retry or kept ready")
 	}
 }
 
-// TestSubscribeRetryGeneration проверяет завершение повтора устаревшего соединения.
+// TestSubscribeRetryGeneration проверяет завершение устаревшего setup.
 func TestSubscribeRetryGeneration(t *testing.T) {
 	t.Parallel()
 
-	client, fault := retryClient(t, true)
-	client.onReconnecting(nil, nil)
-
-	done := make(chan struct{})
-
-	go func() { client.setups.Wait(); close(done) }()
+	fixture, done := retryClient(t, false)
+	fixture.config.OnReconnecting(fixture.mqtt, fixture.config)
 
 	select {
 	case <-done:
@@ -158,7 +121,7 @@ func TestSubscribeRetryGeneration(t *testing.T) {
 		t.Fatal("stale setup did not exit")
 	}
 
-	if client.Ready() || fault.attempts.Load() != 1 {
+	if fixture.client.Ready() {
 		t.Fatal("stale generation subscribed")
 	}
 }

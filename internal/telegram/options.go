@@ -15,6 +15,7 @@ type options struct {
 	onCallback      CallbackHandler
 	onWidgetQuery   func(context.Context, WidgetQuery)
 	serverURL       string
+	httpClient      HTTPClient
 	connectTimeout  time.Duration
 	pollTimeout     time.Duration
 	queueSize       int
@@ -66,7 +67,7 @@ func (o options) Validate() error {
 	return nil
 }
 
-// WithServerURL задаёт адрес Bot API (для тестов - httptest.Server).
+// WithServerURL задаёт адрес Bot API.
 func WithServerURL(url string) Option {
 	return func(o *options) { o.serverURL = url }
 }
@@ -128,4 +129,9 @@ func WithCallbackHandler(handler CallbackHandler) Option {
 // WithWidgetQueryHandler задаёт обработчик запросов виджетов.
 func WithWidgetQueryHandler(handler func(context.Context, WidgetQuery)) Option {
 	return func(o *options) { o.onWidgetQuery = handler }
+}
+
+// WithHTTPClient задаёт HTTP-клиент Bot API.
+func WithHTTPClient(client HTTPClient) Option {
+	return func(o *options) { o.httpClient = client }
 }

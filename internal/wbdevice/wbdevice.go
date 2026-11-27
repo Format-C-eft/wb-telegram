@@ -67,7 +67,7 @@ type Device struct {
 	flagMu sync.Mutex
 }
 
-// New создаёт устройство deviceID; подключение — в Run.
+// New создаёт устройство с заданными контролами и настройками подключения.
 func New(deviceID string, opts ...Option) (*Device, error) {
 	o := defaultOptions()
 
@@ -116,15 +116,12 @@ func New(deviceID string, opts ...Option) (*Device, error) {
 		SetConnectionLostHandler(d.onConnectionLost).
 		SetReconnectingHandler(d.onReconnecting)
 
-	d.client = paho.NewClient(clientOptions)
+	d.client = o.clientFactory(clientOptions)
 
 	return d, nil
 }
 
-// Run запускает доставку записей обработчику, подключается к брокеру и ждёт (не дольше таймаута
-// устройства), пока устройство будет опубликовано и начнёт принимать записи в /on: компоненты,
-// запущенные после него, застают устройство готовым. Если брокер пока недоступен или публикация
-// затянулась, подключение продолжается в фоне, а Connected остаётся false до готовности.
+// Run запускает устройство и ожидает первоначальную готовность в пределах таймаута.
 func (d *Device) Run(ctx context.Context) error {
 	d.workers.Add(1)
 
@@ -160,8 +157,7 @@ func (d *Device) Run(ctx context.Context) error {
 	return nil
 }
 
-// onConnect при каждом (пере)подключении публикует состояние устройства и подписывается на /on,
-// повторяя попытки с нарастающей паузой, пока соединение то же самое и устройство не остановлено.
+// onConnect публикует состояние и подписки нового подключения.
 func (d *Device) onConnect(_ paho.Client) {
 	generation := d.nextGeneration()
 	delay := setupRetryMin
@@ -195,13 +191,7 @@ func (d *Device) onConnect(_ paho.Client) {
 	d.markReady(generation)
 }
 
-// setup публикует состояние устройства, один раз за процесс убирает контролы удалённых команд,
-// подписывается на запись в контролы и последним шагом снимает ошибку устройства — всё, что должно
-// быть сделано до того, как устройство считается готовым. Пустой meta/error означает для UI и правил,
-// что устройство работает, поэтому он публикуется только когда записи в /on уже принимаются.
-//
-// Уборка идёт до подписки на /on: её подписка на controls/# перекрывала бы подписки на /on,
-// и запись в контрол могла бы дойти до обработчика дважды.
+// setup подготавливает состояние и подписки текущего подключения.
 func (d *Device) setup(generation uint64) error {
 	errPublish := d.publishState()
 	if errPublish != nil {
@@ -218,9 +208,7 @@ func (d *Device) setup(generation uint64) error {
 	return d.publishHealthy(generation)
 }
 
-// publishHealthy снимает флаг ошибки устройства, если соединение generation всё ещё текущее.
-// Постановка в очередь идёт под flagMu, как и "r" в Shutdown, а paho отправляет сообщения
-// в порядке постановки: после остановки пустой флаг не перезапишет "r".
+// publishHealthy снимает флаг ошибки текущего подключения.
 func (d *Device) publishHealthy(generation uint64) error {
 	d.flagMu.Lock()
 
@@ -294,8 +282,7 @@ func (d *Device) markReady(generation uint64) {
 	d.options.onConnected(true)
 }
 
-// publishState публикует meta устройства, meta, значения и ошибки контролов; ошибку устройства
-// снимает setup, когда устройство готово.
+// publishState публикует метаданные устройства и состояние контролов.
 func (d *Device) publishState() error {
 	deviceMeta, errMarshal := json.Marshal(DeviceMeta{Driver: d.options.driver, Title: d.options.title})
 	if errMarshal != nil {
@@ -317,9 +304,7 @@ func (d *Device) publishState() error {
 	return nil
 }
 
-// publishControl публикует meta, текущее значение и флаг ошибки контрола.
-// Значение Volatile-контрола при (пере)подключении возвращается к Initial и не повторяется;
-// пустое значение не публикуется (см. Control.Initial).
+// publishControl публикует метаданные и состояние контрола.
 func (d *Device) publishControl(control Control) error {
 	meta, errMarshal := json.Marshal(control.Meta)
 	if errMarshal != nil {
@@ -382,7 +367,7 @@ func waitSubscribed(token paho.Token, topic string, timeout time.Duration) error
 		return &Error{kind: kindMQTT, Op: "subscribe", Topic: topic, Message: errSubscribe.Error()}
 	}
 
-	subscription, ok := token.(*paho.SubscribeToken)
+	subscription, ok := token.(subscriptionToken)
 	if !ok {
 		return &Error{kind: kindMQTT, Op: "subscribe", Topic: topic, Message: "unexpected subscription token"}
 	}
@@ -545,10 +530,7 @@ func (d *Device) Connected() bool {
 	return d.ready.Load() && d.client.IsConnectionOpen()
 }
 
-// Shutdown помечает устройство ошибкой r, отключается от брокера и дожидается остановки доставки
-// записей. Подтверждение r ждётся не дольше таймаута устройства и дедлайна ctx, но не меньше
-// shutdownPublishFloor: даже с исчерпанным ctx устройство пытается честно сказать, что остановлено.
-// Вызывать из WriteHandler нельзя.
+// Shutdown публикует флаг остановки и завершает доставку записей.
 func (d *Device) Shutdown(ctx context.Context) error {
 	d.stopOnce.Do(func() { close(d.stop) })
 

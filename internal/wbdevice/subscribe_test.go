@@ -5,87 +5,83 @@ import (
 	"testing"
 	"time"
 
-	mqtt "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/packets"
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/wbdevice/mock"
 )
 
-// deniedSubscription подменяет результат подписки на указанный топик.
-type deniedSubscription struct {
-	mqtt.HookBase
-	topic string
-}
+// TestWaitSubscribed проверяет SUBACK, отказ, неизвестный токен и таймаут.
+func TestWaitSubscribed(t *testing.T) {
+	t.Parallel()
 
-// ID возвращает имя тестового хука.
-func (*deniedSubscription) ID() string { return "denied-subscription" }
+	for _, scenario := range []string{"granted", "denied", "missing", "unexpected", "mqtt", "timeout"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Parallel()
 
-// Provides объявляет событие подтверждения подписки.
-func (*deniedSubscription) Provides(event byte) bool { return event == mqtt.OnSubscribed }
+			controller := gomock.NewController(t)
+			topic := controlOnTopic("telegram_bot", "send")
 
-// OnSubscribed возвращает отказ для указанного топика.
-func (h *deniedSubscription) OnSubscribed(_ *mqtt.Client, packet packets.Packet, codes []byte) {
-	for index, filter := range packet.Filters {
-		if filter.Filter == h.topic {
-			codes[index] = 0x80
-		}
+			token := mock.NewMockSubscriptionToken(controller)
+			if scenario != "unexpected" {
+				token.EXPECT().WaitTimeout(time.Millisecond).Return(scenario != "timeout")
+			}
+
+			var (
+				want         error = ErrMQTT
+				errSubscribe error
+			)
+
+			switch scenario {
+			case "timeout":
+				want = ErrTimeout
+			case "mqtt":
+				token.EXPECT().Error().Return(errors.New("subscribe denied"))
+			case "unexpected":
+				unexpected := mock.NewMockToken(controller)
+				unexpected.EXPECT().WaitTimeout(time.Millisecond).Return(true)
+				unexpected.EXPECT().Error().Return(nil)
+				errSubscribe = waitSubscribed(unexpected, topic, time.Millisecond)
+			default:
+				token.EXPECT().Error().Return(nil)
+
+				result := map[string]byte{}
+				if scenario != "missing" {
+					result[topic] = 0x80
+				}
+
+				if scenario == "granted" {
+					result[topic] = 1
+					want = nil
+				}
+
+				token.EXPECT().Result().Return(result)
+			}
+
+			if scenario != "unexpected" {
+				errSubscribe = waitSubscribed(token, topic, time.Millisecond)
+			}
+
+			if !errors.Is(errSubscribe, want) {
+				t.Fatalf("waitSubscribed = %v, want %v", errSubscribe, want)
+			}
+		})
 	}
 }
 
-// TestDeniedWriteSubscription проверяет готовность после отказа в подписке.
+// TestDeniedWriteSubscription проверяет отсутствие готовности при отказе SUBACK.
 func TestDeniedWriteSubscription(t *testing.T) {
 	t.Parallel()
 
-	_, broker := startBrokerServer(t, &deniedSubscription{topic: controlOnTopic("telegram_bot", "send")})
+	dev, client, _, controller := newMockDevice(t)
+	client.EXPECT().IsConnectionOpen().Return(true).AnyTimes()
+	expectState(client, controller, "", "{}", "")
+	expectCollection(client, controller, "/devices/telegram_bot/controls/#")
 
-	device, errNew := New("telegram_bot", WithBroker(broker), WithControls(testControls()...), WithTimeout(time.Second))
-	if errNew != nil {
-		t.Fatal(errNew)
-	}
+	topic := controlOnTopic(dev.id, "send")
+	client.EXPECT().Subscribe(topic, byte(1), gomock.Any()).Return(subscribedToken(controller, topic, 0x80))
 
-	t.Cleanup(func() { _ = device.Stop() })
-
-	errRun := device.Run(t.Context())
-	if errRun != nil {
-		t.Fatal(errRun)
-	}
-
-	if device.Connected() {
-		t.Fatal("device ready after subscription denial")
-	}
-}
-
-// TestPurgeDeniedSubscription проверяет ошибку при отказе подписки уборки.
-func TestPurgeDeniedSubscription(t *testing.T) {
-	t.Parallel()
-
-	_, broker := startBrokerServer(t, &deniedSubscription{topic: "/devices/telegram_bot/#"})
-
-	errPurge := Purge(broker, "telegram_bot", time.Millisecond)
-	if !errors.Is(errPurge, ErrMQTT) {
-		t.Fatalf("Purge = %v, want MQTT error", errPurge)
-	}
-}
-
-// TestLateConnectionLostPreservesReady проверяет запоздавший callback прежнего соединения.
-func TestLateConnectionLostPreservesReady(t *testing.T) {
-	t.Parallel()
-
-	broker := startBroker(t)
-
-	device, errNew := New("telegram_bot", WithBroker(broker), WithControls(testControls()...))
-	if errNew != nil {
-		t.Fatal(errNew)
-	}
-
-	t.Cleanup(func() { _ = device.Stop() })
-
-	errRun := device.Run(t.Context())
-	if errRun != nil {
-		t.Fatal(errRun)
-	}
-
-	device.onConnectionLost(device.client, errors.New("previous connection"))
-
-	if !device.Connected() {
-		t.Fatal("late callback invalidated the current connection")
+	errSetup := dev.setup(dev.nextGeneration())
+	if !errors.Is(errSetup, ErrMQTT) || dev.Connected() {
+		t.Fatalf("setup = %v, ready = %v", errSetup, dev.Connected())
 	}
 }

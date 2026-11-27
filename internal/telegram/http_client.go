@@ -5,9 +5,17 @@ import (
 	"net/http/httptrace"
 )
 
+//go:generate ../../bin/mockgen -source=http_client.go -destination=mock/http_client_mock.go -package=mock
+
+// HTTPClient выполняет HTTP-запросы Bot API.
+type HTTPClient interface {
+	// Do выполняет HTTP-запрос.
+	Do(*http.Request) (*http.Response, error)
+}
+
 // healthClient оборачивает HTTP-клиент Bot API: ответ сервера или новое соединение значит, что связь жива.
 type healthClient struct {
-	inner *http.Client
+	inner HTTPClient
 	alive func()
 }
 
@@ -21,7 +29,7 @@ func (h *healthClient) Do(req *http.Request) (*http.Response, error) {
 		},
 	}
 
-	resp, errDo := h.inner.Do(req.WithContext(httptrace.WithClientTrace(req.Context(), trace))) //nolint:gosec // адрес Bot API задан настройками, не вводом пользователя
+	resp, errDo := h.inner.Do(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
 	if errDo != nil {
 		return nil, errDo
 	}

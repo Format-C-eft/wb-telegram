@@ -4,68 +4,37 @@ import (
 	"context"
 	"errors"
 	"strings"
-	"sync/atomic"
-
 	"testing"
 	"time"
 
-	mqtt "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/packets"
+	"github.com/Format-C-eft/wb-telegram/internal/wb_history/mock"
 )
-
-// waitPending ждёт регистрации запроса без зависимости от задержки брокера.
-func waitPending(t *testing.T, client *Client) {
-	t.Helper()
-
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		client.mu.Lock()
-		active := client.pending != nil
-		client.mu.Unlock()
-
-		if active {
-			return
-		}
-
-		time.Sleep(time.Millisecond)
-	}
-
-	t.Fatal("pending not registered")
-}
 
 // TestReadCancellation проверяет отмену и освобождение единственного pending.
 func TestReadCancellation(t *testing.T) {
 	t.Parallel()
 
-	client, errNew := New(WithBroker(localBroker(t)))
-	if errNew != nil {
-		t.Fatal(errNew)
-	}
-
-	t.Cleanup(func() { _ = client.Stop() })
-
-	errRun := client.Run(context.Background())
-	if errRun != nil {
-		t.Fatal(errRun)
-	}
-
-	awaitReady(t, client)
+	fixture := newHistoryFixture(t)
+	fixture.run(t)
+	requests := fixture.publish(t, completedToken(fixture.ctrl, nil))
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	result := make(chan error, 1)
 
-	go func() { _, errRead := client.Read(ctx, historyQuery()); result <- errRead }()
+	go func() { _, errRead := fixture.client.Read(ctx, historyQuery()); result <- errRead }()
 
-	waitPending(t, client)
+	<-requests
 	cancel()
 
 	if !errors.Is(<-result, ErrCanceled) {
 		t.Fatal("cancel not propagated")
 	}
 
-	client.mu.Lock()
-	active := client.pending != nil
-	client.mu.Unlock()
+	fixture.client.mu.Lock()
+	active := fixture.client.pending != nil
+	fixture.client.mu.Unlock()
 
 	if active {
 		t.Fatal("pending leaked")
@@ -74,7 +43,7 @@ func TestReadCancellation(t *testing.T) {
 	short, shortCancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer shortCancel()
 
-	_, errShort := client.Read(short, historyQuery())
+	_, errShort := fixture.client.Read(short, historyQuery())
 	if !errors.Is(errShort, ErrTimeout) {
 		t.Fatal(errShort)
 	}
@@ -84,25 +53,16 @@ func TestReadCancellation(t *testing.T) {
 func TestStopPending(t *testing.T) {
 	t.Parallel()
 
-	client, errNew := New(WithBroker(localBroker(t)))
-	if errNew != nil {
-		t.Fatal(errNew)
-	}
-
-	errRun := client.Run(context.Background())
-	if errRun != nil {
-		t.Fatal(errRun)
-	}
-
-	awaitReady(t, client)
-
+	fixture := newHistoryFixture(t)
+	fixture.run(t)
+	requests := fixture.publish(t, completedToken(fixture.ctrl, nil))
 	result := make(chan error, 1)
 
-	go func() { _, errRead := client.Read(context.Background(), historyQuery()); result <- errRead }()
+	go func() { _, errRead := fixture.client.Read(context.Background(), historyQuery()); result <- errRead }()
 
-	waitPending(t, client)
+	<-requests
 
-	errStop := client.Stop()
+	errStop := fixture.client.Stop()
 	if errStop != nil {
 		t.Fatal(errStop)
 	}
@@ -111,24 +71,23 @@ func TestStopPending(t *testing.T) {
 		t.Fatal("stop did not close query")
 	}
 
-	errAgain := client.Run(context.Background())
+	errAgain := fixture.client.Run(context.Background())
 	if !errors.Is(errAgain, ErrClosed) {
 		t.Fatal(errAgain)
 	}
 }
 
-// TestBrokerUnavailableStart проверяет неблокирующий запуск без брокера.
+// TestBrokerUnavailableStart проверяет неблокирующий запуск без CONNACK.
 func TestBrokerUnavailableStart(t *testing.T) {
 	t.Parallel()
 
-	client, errNew := New(WithBroker("tcp://127.0.0.1:1"))
-	if errNew != nil {
-		t.Fatal(errNew)
-	}
+	fixture := newHistoryFixture(t)
+	token := mock.NewMockToken(fixture.ctrl)
+	fixture.mqtt.EXPECT().Connect().Return(token)
 
 	started := time.Now()
 
-	errRun := client.Run(context.Background())
+	errRun := fixture.client.Run(context.Background())
 	if errRun != nil {
 		t.Fatal(errRun)
 	}
@@ -137,110 +96,136 @@ func TestBrokerUnavailableStart(t *testing.T) {
 		t.Fatal("Run waited for broker")
 	}
 
-	_, errRead := client.Read(context.Background(), historyQuery())
+	_, errRead := fixture.client.Read(context.Background(), historyQuery())
 	if !errors.Is(errRead, ErrUnavailable) {
 		t.Fatal(errRead)
 	}
-
-	errStop := client.Stop()
-	if errStop != nil {
-		t.Fatal(errStop)
-	}
 }
 
-// TestReconnectNoReplay проверяет завершение запроса при обрыве без его воспроизведения.
+// TestReconnectNoReplay проверяет завершение запроса при обрыве без воспроизведения.
 func TestReconnectNoReplay(t *testing.T) {
 	t.Parallel()
 
-	server, broker := localBrokerServer(t)
-	counter := &requestCounter{seen: make(chan struct{}, 2)}
-
-	errHook := server.AddHook(counter, nil)
-	if errHook != nil {
-		t.Fatal(errHook)
-	}
-
-	client, errNew := New(WithBroker(broker))
-	if errNew != nil {
-		t.Fatal(errNew)
-	}
-
-	t.Cleanup(func() { _ = client.Stop() })
-
-	errRun := client.Run(context.Background())
-	if errRun != nil {
-		t.Fatal(errRun)
-	}
-
-	awaitReady(t, client)
-
+	fixture := newHistoryFixture(t)
+	fixture.run(t)
+	requests := fixture.publish(t, completedToken(fixture.ctrl, nil))
 	result := make(chan error, 1)
 
-	go func() { _, errRead := client.Read(context.Background(), historyQuery()); result <- errRead }()
+	go func() { _, errRead := fixture.client.Read(context.Background(), historyQuery()); result <- errRead }()
 
-	waitPending(t, client)
+	<-requests
+	fixture.config.OnReconnecting(fixture.mqtt, fixture.config)
 
-	select {
-	case <-counter.seen:
-	case <-time.After(time.Second):
-		t.Fatal("request missing at broker")
-	}
-
-	id := client.topic[strings.LastIndex(client.topic, "/")+1:]
-
-	remote, ok := server.Clients.Get(id)
-	if !ok {
-		t.Fatal("broker client missing")
-	}
-
-	errClose := remote.Net.Conn.Close()
-	if errClose != nil {
-		t.Fatal(errClose)
-	}
-
-	select {
-	case errRead := <-result:
-		if !errors.Is(errRead, ErrUnavailable) {
-			t.Fatal(errRead)
-		}
-	case <-time.After(3 * time.Second):
+	if !errors.Is(<-result, ErrUnavailable) {
 		t.Fatal("disconnect did not fail query")
 	}
 
-	awaitReady(t, client)
-	client.mu.Lock()
-	active := client.pending != nil
-	sequence := client.sequence
-	client.mu.Unlock()
+	fixture.expectSubscribe(fixture.subscription(1))
+	fixture.config.OnConnect(fixture.mqtt)
 
-	if active || sequence != 1 || counter.count.Load() != 1 {
+	if !fixture.client.Ready() {
+		t.Fatal("reconnect did not resubscribe")
+	}
+
+	fixture.client.mu.Lock()
+	active := fixture.client.pending != nil
+	sequence := fixture.client.sequence
+	fixture.client.mu.Unlock()
+
+	if active || sequence != 1 {
 		t.Fatal("request was replayed")
 	}
 }
 
-// requestCounter считает запросы истории на брокере.
-type requestCounter struct {
-	mqtt.HookBase
-	count atomic.Int64
-	seen  chan struct{}
+// TestReadPublishError проверяет ошибку подтверждения публикации.
+func TestReadPublishError(t *testing.T) {
+	t.Parallel()
+
+	fixture := newHistoryFixture(t)
+	fixture.run(t)
+	fixture.publish(t, completedToken(fixture.ctrl, errors.New("publish failed")))
+
+	_, errRead := fixture.client.Read(context.Background(), historyQuery())
+	if !errors.Is(errRead, ErrUnavailable) {
+		t.Fatal(errRead)
+	}
 }
 
-// ID возвращает имя тестового хука.
-func (*requestCounter) ID() string { return "history-counter" }
+// TestReadDeadline проверяет истечение срока ожидания ответа после PUBACK.
+func TestReadDeadline(t *testing.T) {
+	t.Parallel()
 
-// Provides задаёт единственное событие хука.
-func (*requestCounter) Provides(event byte) bool { return event == mqtt.OnPublish }
+	fixture := newHistoryFixture(t)
+	fixture.run(t)
+	fixture.publish(t, completedToken(fixture.ctrl, nil))
 
-// OnPublish считает запросы, исключая ответы.
-func (counter *requestCounter) OnPublish(_ *mqtt.Client, packet packets.Packet) (packets.Packet, error) {
-	if strings.HasPrefix(packet.TopicName, "/rpc/v1/db_logger/history/get_values/") && !strings.HasSuffix(packet.TopicName, "/reply") {
-		counter.count.Add(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
+	defer cancel()
 
-		select {
-		case counter.seen <- struct{}{}:
-		default:
-		}
+	_, errRead := fixture.client.Read(ctx, historyQuery())
+	if !errors.Is(errRead, ErrTimeout) {
+		t.Fatal(errRead)
 	}
+}
 
-	return packet, nil
+// TestReadIgnoredReplies проверяет фильтрацию retained и чужого ID.
+func TestReadIgnoredReplies(t *testing.T) {
+	t.Parallel()
+
+	for _, retained := range []bool{true, false} {
+		t.Run(map[bool]string{true: "retained", false: "unknown_id"}[retained], func(t *testing.T) {
+			t.Parallel()
+
+			fixture := newHistoryFixture(t)
+			fixture.run(t)
+			requests := fixture.publish(t, completedToken(fixture.ctrl, nil))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			result := make(chan error, 1)
+
+			go func() { _, errRead := fixture.client.Read(ctx, historyQuery()); result <- errRead }()
+
+			<-requests
+
+			id := "2"
+			if retained {
+				id = "1"
+			}
+
+			fixture.deliver(`{"id":"`+id+`","result":{"values":[],"has_more":false}}`, retained)
+
+			select {
+			case errRead := <-result:
+				t.Fatalf("irrelevant reply completed query: %v", errRead)
+			case <-time.After(10 * time.Millisecond):
+			}
+
+			cancel()
+
+			if !errors.Is(<-result, ErrCanceled) {
+				t.Fatal("irrelevant reply replaced cancellation")
+			}
+		})
+	}
+}
+
+// TestReadOversizedReply проверяет ограничение размера до копирования ответа.
+func TestReadOversizedReply(t *testing.T) {
+	t.Parallel()
+
+	fixture := newHistoryFixture(t)
+	fixture.run(t)
+	requests := fixture.publish(t, completedToken(fixture.ctrl, nil))
+	result := make(chan error, 1)
+
+	go func() { _, errRead := fixture.client.Read(context.Background(), historyQuery()); result <- errRead }()
+
+	<-requests
+	fixture.deliver(strings.Repeat(" ", maxResponseBytes+1), false)
+
+	if !errors.Is(<-result, ErrTooManyData) {
+		t.Fatal("oversized reply accepted")
+	}
 }

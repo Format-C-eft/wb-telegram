@@ -104,6 +104,14 @@ type incoming struct {
 	pending   *pending
 }
 
+//go:generate ../../bin/mockgen -source=wb_history.go -destination=mock/subscription_mock.go -package=mock -mock_names=subscriptionToken=MockSubscriptionToken
+
+// subscriptionToken представляет подтверждение подписки с кодами SUBACK.
+type subscriptionToken interface {
+	paho.Token
+	Result() map[string]byte
+}
+
 // Client читает историю через отдельное MQTT-соединение.
 type Client struct {
 	options                options
@@ -121,7 +129,7 @@ type Client struct {
 
 // New создаёт клиент без подключения к брокеру.
 func New(opts ...Option) (*Client, error) {
-	o := options{broker: "tcp://127.0.0.1:1883"}
+	o := options{broker: "tcp://127.0.0.1:1883", clientFactory: paho.NewClient}
 
 	for _, opt := range opts {
 		if opt != nil {
@@ -144,7 +152,7 @@ func New(opts ...Option) (*Client, error) {
 	id := "wb-telegram-history-" + hex.EncodeToString(nonce[:])
 	c := &Client{options: o, topic: "/rpc/v1/db_logger/history/get_values/" + id, messages: make(chan incoming, 1), stop: make(chan struct{}), done: make(chan struct{})}
 	config := paho.NewClientOptions().AddBroker(o.broker).SetClientID(id).SetCleanSession(true).SetAutoReconnect(true).SetConnectRetry(true).SetConnectTimeout(time.Second).SetConnectRetryInterval(time.Second).SetMaxReconnectInterval(5 * time.Second).SetWriteTimeout(time.Second).SetResumeSubs(false).SetStore(discardStore{}).SetOnConnectHandler(c.onConnect).SetReconnectingHandler(c.onReconnecting)
-	c.client = paho.NewClient(config)
+	c.client = o.clientFactory(config)
 
 	return c, nil
 }
@@ -367,7 +375,7 @@ func (c *Client) subscribe(client paho.Client, generation uint64) bool {
 		return false
 	}
 
-	subscription, ok := token.(*paho.SubscribeToken)
+	subscription, ok := token.(subscriptionToken)
 	if !ok {
 		return false
 	}

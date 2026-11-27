@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +13,9 @@ import (
 	"time"
 
 	"github.com/go-telegram/bot"
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/telegram/mock"
 
 	"github.com/Format-C-eft/wb-telegram/internal/retry"
 )
@@ -19,7 +24,7 @@ import (
 func startClient(t *testing.T, api *fakeAPI, handler Handler, opts ...Option) *Client {
 	t.Helper()
 
-	base := []Option{WithServerURL(api.server.URL), WithRateLimits(time.Millisecond, time.Millisecond), WithRetry(time.Millisecond, 10*time.Millisecond)}
+	base := []Option{WithServerURL("https://api.telegram.test"), WithHTTPClient(api.client), WithRateLimits(time.Millisecond, time.Millisecond), WithRetry(time.Millisecond, 10*time.Millisecond)}
 
 	client, errNew := New(testToken, handler, append(base, opts...)...)
 	if errNew != nil {
@@ -96,6 +101,7 @@ func TestDispatchOrdersCommandsAndChecksRecipient(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 
+	api.queueRawUpdate(`{"update_id":40,"message":{"message_id":4,"date":1,"chat":{"id":-100,"type":"group"},"text":"/gate@HomeAlias"}}`)
 	api.queueRawUpdate(`{"update_id":41,"message":{"message_id":1,"date":1,"chat":{"id":-100,"type":"group"},"text":"/gate@OtherBot"}}`)
 	api.queueRawUpdate(`{"update_id":42,"message":{"message_id":2,"date":1,"chat":{"id":-100,"type":"group"},"text":"/gate@myhomebot"}}`)
 	api.queueRawUpdate(`{"update_id":43,"message":{"message_id":3,"date":1,"chat":{"id":-100,"type":"group"},"text":"/gate 2"}}`)
@@ -136,6 +142,13 @@ func TestDispatchOrdersCommandsAndChecksRecipient(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("command %q was not delivered", want)
 		}
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+
+	if api.getMeCalls != 1 {
+		t.Fatalf("getMe calls = %d, want cached bot username", api.getMeCalls)
 	}
 }
 
@@ -291,7 +304,7 @@ func TestTransportErrorHidesToken(t *testing.T) {
 	api := newFakeAPI(t)
 	client := startClient(t, api, func(context.Context, Message) {})
 
-	api.server.Close()
+	api.close()
 
 	errSet := client.SetCommands(context.Background(), 100, nil)
 	if !errors.Is(errSet, ErrTransient) {
@@ -427,5 +440,120 @@ func TestDeleteWebhookHonorsRetryAfter(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no retry pause observed")
+	}
+}
+
+// TestCallbackPollingAndAnswer проверяет обычный callback и подтверждение через Bot API.
+func TestCallbackPollingAndAnswer(t *testing.T) {
+	t.Parallel()
+
+	api := newFakeAPI(t)
+	received := make(chan Callback, 1)
+	client := startClient(t, api, func(context.Context, Message) {
+		t.Error("callback was delivered as text")
+	}, WithCallbackHandler(func(_ context.Context, callback Callback) { received <- callback }))
+
+	api.queueRawUpdate(`{"update_id":17,"callback_query":{"id":"press-1","from":{"id":9,"is_bot":false,"first_name":"User"},"message":{"message_id":3,"date":100,"chat":{"id":7,"type":"private"}},"data":"open-gate"}}`)
+
+	select {
+	case got := <-received:
+		want := Callback{UpdateID: 17, QueryID: "press-1", FromID: 9, ChatID: 7, ChatType: "private", MessageID: 3, Data: "open-gate", Accessible: true}
+		if got != want {
+			t.Fatalf("callback = %+v, want %+v", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("callback was not delivered")
+	}
+
+	errAnswer := client.AnswerCallback(t.Context(), "press-1", "Opened", true)
+	if errAnswer != nil {
+		t.Fatal(errAnswer)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+
+	if answer := api.callbackAnswers["press-1"]; answer != "Opened:true" {
+		t.Fatalf("callback answer = %q", answer)
+	}
+}
+
+// TestShutdownCancelsPendingHTTP проверяет завершение HTTP polling и отправки до возврата Shutdown.
+func TestShutdownCancelsPendingHTTP(t *testing.T) {
+	t.Parallel()
+
+	inner := mock.NewMockHTTPClient(gomock.NewController(t))
+	pollEntered := make(chan struct{})
+	pollReturned := make(chan struct{})
+	sendEntered := make(chan struct{})
+	sendReturned := make(chan struct{})
+
+	inner.EXPECT().Do(gomock.Any()).DoAndReturn(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodPost || request.URL.Host != "api.telegram.test" {
+			t.Errorf("unexpected HTTP request: %s %s", request.Method, request.URL)
+		}
+
+		switch request.URL.Path {
+		case "/bot" + testToken + "/deleteWebhook":
+			recorder := httptest.NewRecorder()
+			writeResult(recorder, "true")
+
+			return recorder.Result(), nil
+		case "/bot" + testToken + "/getUpdates":
+			close(pollEntered)
+			<-request.Context().Done()
+			close(pollReturned)
+		case "/bot" + testToken + "/sendMessage":
+			close(sendEntered)
+			<-request.Context().Done()
+			close(sendReturned)
+		default:
+			t.Errorf("unexpected method: %s", request.URL.Path)
+
+			return nil, errors.New("unexpected method")
+		}
+
+		return nil, request.Context().Err()
+	}).Times(3)
+
+	client, errNew := New(testToken, func(context.Context, Message) {}, WithHTTPClient(inner), WithServerURL("https://api.telegram.test"))
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+
+	errRun := client.Run(t.Context())
+	if errRun != nil {
+		t.Fatal(errRun)
+	}
+
+	t.Cleanup(func() { _ = client.Stop() })
+
+	errSend := client.Send(7, "pending")
+	if errSend != nil {
+		t.Fatal(errSend)
+	}
+
+	for _, entered := range []<-chan struct{}{pollEntered, sendEntered} {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("HTTP request did not start")
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+
+	errShutdown := client.Shutdown(ctx)
+	if errShutdown != nil {
+		t.Fatal(errShutdown)
+	}
+
+	for _, completed := range []<-chan struct{}{pollReturned, sendReturned, client.pollDone, client.sendDone, client.webhookDone} {
+		select {
+		case <-completed:
+		default:
+			t.Fatal("Shutdown returned before HTTP goroutines finished")
+		}
 	}
 }

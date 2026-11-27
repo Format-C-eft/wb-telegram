@@ -8,7 +8,13 @@ import (
 
 // Option настраивает клиент истории.
 type Option func(*options)
-type options struct{ broker string }
+
+//go:generate ../../bin/mockgen -destination=mock/paho_mock.go -package=mock github.com/eclipse/paho.mqtt.golang Client,Token,Message
+
+type options struct {
+	broker        string
+	clientFactory func(*paho.ClientOptions) paho.Client
+}
 
 // Validate проверяет адрес брокера.
 func (o options) Validate() error {

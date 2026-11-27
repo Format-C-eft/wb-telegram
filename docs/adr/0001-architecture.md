@@ -11,7 +11,7 @@
 живёт в wb-rules. Новая команда требует настройки и правила, без пересборки бота.
 
 В рабочем коде используются `github.com/go-telegram/bot` и
-`github.com/eclipse/paho.mqtt.golang`; для тестов - mochi-mqtt и gomock.
+`github.com/eclipse/paho.mqtt.golang`; для тестов - gomock.
 MQTT Conventions реализованы в `internal/wbdevice` напрямую на paho.
 Бинарь статический (`CGO_ENABLED=0`), загрузки Go-плагинов нет.
 
@@ -281,5 +281,8 @@ Telegram; на PNG ряды обозначены цветом и номером.
 - Telegram отдаёт накопленные обновления после запуска; бот проверяет возраст
   команды, а не сбрасывает очередь через `WithInitialOffset`.
 
-Тесты используют stdlib `testing`, `httptest.Server`, встроенный брокер mochi-mqtt
-и gomock. Проверки разработки: `make test`, `make lint-full`, `make build`.
+Тесты используют stdlib `testing` и сгенерированные моки gomock для HTTP-клиента,
+MQTT-клиентов и зависимостей сервиса. Реальные сетевые слушатели не запускаются.
+Проверки запросов Telegram выполняются через мок HTTP-клиента, MQTT-публикаций и
+подписок - через моки paho. Проверки разработки: `make test`, `make lint-full`,
+`make build`.

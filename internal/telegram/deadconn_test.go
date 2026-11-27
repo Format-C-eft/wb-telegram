@@ -2,172 +2,101 @@ package telegram
 
 import (
 	"context"
-	"crypto/x509"
+	"errors"
 	"io"
-	"net"
 	"net/http"
-	"net/http/httptest"
-	"sync"
+	"net/http/httptrace"
 	"testing"
-	"time"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/telegram/mock"
 )
 
-// blackholeProxy пересылает TCP к серверу; после freeze уже открытые соединения
-// перестают пересылать данные (как после перезагрузки роутера), новые работают.
-type blackholeProxy struct {
-	listener net.Listener
-	target   string
-
-	mu     sync.Mutex
-	frozen map[net.Conn]bool
-	conns  []net.Conn
-}
-
-// newBlackholeProxy запускает прокси к target на 127.0.0.1.
-func newBlackholeProxy(t *testing.T, target string) *blackholeProxy {
-	t.Helper()
-
-	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
-	if errListen != nil {
-		t.Fatalf("listen: %v", errListen)
-	}
-
-	p := &blackholeProxy{listener: listener, target: target, frozen: map[net.Conn]bool{}}
-
-	t.Cleanup(p.close)
-
-	go p.serve()
-
-	return p
-}
-
-// serve принимает соединения и пересылает их к серверу.
-func (p *blackholeProxy) serve() {
-	for {
-		client, errAccept := p.listener.Accept()
-		if errAccept != nil {
-			return
-		}
-
-		server, errDial := net.Dial("tcp", p.target)
-		if errDial != nil {
-			_ = client.Close()
-
-			continue
-		}
-
-		p.mu.Lock()
-		p.conns = append(p.conns, client, server)
-		p.mu.Unlock()
-
-		go p.pipe(client, server, client)
-		go p.pipe(server, client, client)
-	}
-}
-
-// pipe копирует данные src → dst, пока соединение key не заморожено.
-func (p *blackholeProxy) pipe(src, dst, key net.Conn) {
-	buffer := make([]byte, 32*1024)
-
-	for {
-		n, errRead := src.Read(buffer)
-		if errRead != nil {
-			return
-		}
-
-		if p.isFrozen(key) {
-			_, _ = io.Copy(io.Discard, src)
-
-			return
-		}
-
-		_, errWrite := dst.Write(buffer[:n])
-		if errWrite != nil {
-			return
-		}
-	}
-}
-
-// freeze замораживает все уже открытые соединения.
-func (p *blackholeProxy) freeze() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for _, conn := range p.conns {
-		p.frozen[conn] = true
-	}
-}
-
-// isFrozen сообщает, заморожено ли соединение.
-func (p *blackholeProxy) isFrozen(conn net.Conn) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return p.frozen[conn]
-}
-
-// close останавливает прокси и закрывает соединения.
-func (p *blackholeProxy) close() {
-	_ = p.listener.Close()
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for _, conn := range p.conns {
-		_ = conn.Close()
-	}
-}
-
-// TestHTTPClientRecoversFromDeadConnection проверяет, что после «тихой» смерти HTTP/2-соединения
-// (пакеты пропадают, сокет не закрыт) клиент сам переходит на новое соединение.
-func TestHTTPClientRecoversFromDeadConnection(t *testing.T) {
+// TestHealthClientRecoversFromFailedRequest проверяет восстановление после ошибки HTTP-запроса.
+func TestHealthClientRecoversFromFailedRequest(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	server.EnableHTTP2 = true
-	server.StartTLS()
-	t.Cleanup(server.Close)
+	inner := mock.NewMockHTTPClient(gomock.NewController(t))
+	response := &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}
+	gomock.InOrder(
+		inner.EXPECT().Do(gomock.Any()).Return(nil, io.ErrUnexpectedEOF),
+		inner.EXPECT().Do(gomock.Any()).Return(response, nil),
+	)
 
-	proxy := newBlackholeProxy(t, server.Listener.Addr().String())
+	alive := 0
+	client := &healthClient{inner: inner, alive: func() { alive++ }}
 
-	client := newHTTPClient(500*time.Millisecond, time.Second)
-
-	roots := x509.NewCertPool()
-	roots.AddCert(server.Certificate())
-	client.Transport.(*http.Transport).TLSClientConfig.RootCAs = roots
-
-	url := "https://" + proxy.listener.Addr().String() + "/"
-
-	// get выполняет запрос и сообщает версию протокола (0 — ошибка).
-	get := func() int {
-		request, errRequest := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
-		if errRequest != nil {
-			t.Fatalf("NewRequest: %v", errRequest)
-		}
-
-		response, errDo := client.Do(request)
-		if errDo != nil {
-			return 0
-		}
-
-		_ = response.Body.Close()
-
-		return response.ProtoMajor
+	request, errRequest := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.telegram.test", nil)
+	if errRequest != nil {
+		t.Fatal(errRequest)
 	}
 
-	if proto := get(); proto != 2 {
-		t.Fatalf("first request protocol = %d, want HTTP/2", proto)
+	failedResponse, errFailed := client.Do(request)
+	if !errors.Is(errFailed, io.ErrUnexpectedEOF) {
+		t.Fatalf("request error = %v, want unexpected EOF", errFailed)
 	}
 
-	proxy.freeze()
+	if failedResponse != nil || alive != 0 {
+		t.Fatalf("failed response = %v; healthy notifications = %d", failedResponse, alive)
+	}
 
-	deadline := time.Now().Add(15 * time.Second)
+	got, errDo := client.Do(request)
+	if errDo != nil {
+		t.Fatal(errDo)
+	}
 
-	for get() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("client did not switch to a new connection after the old one died")
-		}
+	if got != response || alive != 1 {
+		t.Fatalf("recovery response = %v; healthy notifications = %d", got, alive)
+	}
+}
+
+// TestHealthClientConnectionTrace проверяет здоровье нового и повторно используемого соединения.
+func TestHealthClientConnectionTrace(t *testing.T) {
+	t.Parallel()
+
+	for _, scenario := range []struct {
+		name      string
+		reused    bool
+		status    int
+		wantAlive int
+	}{
+		{name: "new connection despite server error", status: http.StatusInternalServerError, wantAlive: 1},
+		{name: "reused connection server error", reused: true, status: http.StatusInternalServerError},
+		{name: "reused connection rate limit", reused: true, status: http.StatusTooManyRequests, wantAlive: 1},
+		{name: "new connection successful response", status: http.StatusOK, wantAlive: 2},
+	} {
+		t.Run(scenario.name, func(subtest *testing.T) {
+			subtest.Parallel()
+
+			inner := mock.NewMockHTTPClient(gomock.NewController(subtest))
+			inner.EXPECT().Do(gomock.Any()).DoAndReturn(func(request *http.Request) (*http.Response, error) {
+				trace := httptrace.ContextClientTrace(request.Context())
+				if trace == nil || trace.GotConn == nil {
+					subtest.Fatal("HTTP connection trace was not installed")
+				}
+
+				trace.GotConn(httptrace.GotConnInfo{Reused: scenario.reused})
+
+				return &http.Response{StatusCode: scenario.status, Body: http.NoBody}, nil
+			})
+
+			alive := 0
+			client := &healthClient{inner: inner, alive: func() { alive++ }}
+
+			request, errRequest := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://api.telegram.test", nil)
+			if errRequest != nil {
+				subtest.Fatal(errRequest)
+			}
+
+			_, errDo := client.Do(request)
+			if errDo != nil {
+				subtest.Fatal(errDo)
+			}
+
+			if alive != scenario.wantAlive {
+				subtest.Fatalf("healthy notifications = %d, want %d", alive, scenario.wantAlive)
+			}
+		})
 	}
 }

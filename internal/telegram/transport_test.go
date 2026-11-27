@@ -2,33 +2,15 @@ package telegram
 
 import (
 	"context"
-	"crypto/x509"
 	"errors"
-	"net"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/telegram/mock"
 )
-
-// slowListener задерживает каждое принятое соединение, имитируя медленное TLS-рукопожатие.
-type slowListener struct {
-	net.Listener
-
-	delay time.Duration
-}
-
-// Accept принимает соединение и выдерживает паузу до начала рукопожатия.
-func (l slowListener) Accept() (net.Conn, error) {
-	conn, errAccept := l.Listener.Accept()
-	if errAccept != nil {
-		return nil, errAccept
-	}
-
-	time.Sleep(l.delay)
-
-	return conn, nil
-}
 
 // TestNewHTTPClientTimeouts проверяет, что таймауты подключения и запроса берутся из настроек.
 func TestNewHTTPClientTimeouts(t *testing.T) {
@@ -49,59 +31,57 @@ func TestNewHTTPClientTimeouts(t *testing.T) {
 		t.Fatalf("Timeout = %v, want connect + poll + margin", client.Timeout)
 	}
 
-	if transport.HTTP2 == nil || transport.HTTP2.SendPingTimeout != maxPingInterval || transport.HTTP2.PingTimeout != 45*time.Second {
+	if transport.HTTP2 == nil || transport.HTTP2.SendPingTimeout != maxPingInterval || transport.HTTP2.PingTimeout != 45*time.Second || transport.HTTP2.WriteByteTimeout != 45*time.Second {
 		t.Fatalf("HTTP2 = %+v, want ping after %v and ping timeout 45s", transport.HTTP2, maxPingInterval)
 	}
 }
 
-// TestNewHTTPClientSlowHandshake проверяет, что рукопожатие дольше таймаута обрывается, а в пределах — проходит.
-func TestNewHTTPClientSlowHandshake(t *testing.T) {
+// TestHealthClientCancellation проверяет отмену выполняющегося запроса HTTP-клиента.
+func TestHealthClientCancellation(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		connect time.Duration
-		wantErr bool
-	}{
-		{name: "handshake slower than timeout", connect: 100 * time.Millisecond, wantErr: true},
-		{name: "handshake within timeout", connect: 2 * time.Second, wantErr: false},
+	inner := mock.NewMockHTTPClient(gomock.NewController(t))
+	entered := make(chan struct{})
+
+	inner.EXPECT().Do(gomock.Any()).DoAndReturn(func(request *http.Request) (*http.Response, error) {
+		close(entered)
+		<-request.Context().Done()
+
+		return nil, request.Context().Err()
+	})
+
+	alive := false
+	client := &healthClient{inner: inner, alive: func() { alive = true }}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	request, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.telegram.test", nil)
+	if errRequest != nil {
+		t.Fatal(errRequest)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+	result := make(chan error, 1)
 
-			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(http.StatusOK)
-			}))
-			server.Listener = slowListener{Listener: server.Listener, delay: 400 * time.Millisecond}
-			server.StartTLS()
-			t.Cleanup(server.Close)
+	go func() {
+		_, errDo := client.Do(request)
+		result <- errDo
+	}()
 
-			client := newHTTPClient(tt.connect, time.Second)
+	<-entered
+	cancel()
 
-			roots := x509.NewCertPool()
-			roots.AddCert(server.Certificate())
-			client.Transport.(*http.Transport).TLSClientConfig.RootCAs = roots
+	select {
+	case errResult := <-result:
+		if !errors.Is(errResult, context.Canceled) {
+			t.Fatalf("request error = %v, want cancellation", errResult)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled request did not finish")
+	}
 
-			request, errRequest := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
-			if errRequest != nil {
-				t.Fatalf("NewRequest: %v", errRequest)
-			}
-
-			response, errDo := client.Do(request)
-			if errDo == nil {
-				_ = response.Body.Close()
-			}
-
-			if tt.wantErr && errDo == nil {
-				t.Fatal("request succeeded, want handshake timeout")
-			}
-
-			if !tt.wantErr && errDo != nil {
-				t.Fatalf("request failed: %v", errDo)
-			}
-		})
+	if alive {
+		t.Fatal("cancellation marked the connection healthy")
 	}
 }
 

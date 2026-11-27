@@ -4,201 +4,214 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
-	mqtt "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/hooks/auth"
-	"github.com/mochi-mqtt/server/v2/listeners"
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/wb_history/mock"
 )
 
-// localBrokerServer создаёт изолированный MQTT-брокер.
-func localBrokerServer(t *testing.T) (*mqtt.Server, string) {
+type historyFixture struct {
+	client  *Client
+	mqtt    *mock.MockClient
+	ctrl    *gomock.Controller
+	config  *paho.ClientOptions
+	handler paho.MessageHandler
+}
+
+// newHistoryFixture создаёт клиент с моками MQTT без подключения к сети.
+func newHistoryFixture(t *testing.T, opts ...Option) *historyFixture {
 	t.Helper()
 
-	server := mqtt.New(&mqtt.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	fixture := &historyFixture{ctrl: gomock.NewController(t)}
+	fixture.mqtt = mock.NewMockClient(fixture.ctrl)
+	factory := func(o *options) {
+		o.clientFactory = func(config *paho.ClientOptions) paho.Client {
+			fixture.config = config
 
-	errAuth := server.AddHook(new(auth.AllowHook), nil)
-	if errAuth != nil {
-		t.Fatal(errAuth)
-	}
-
-	listener := listeners.NewTCP(listeners.Config{ID: "history", Address: "127.0.0.1:0"})
-
-	errListener := server.AddListener(listener)
-	if errListener != nil {
-		t.Fatal(errListener)
-	}
-
-	errServe := server.Serve()
-	if errServe != nil {
-		t.Fatal(errServe)
-	}
-
-	t.Cleanup(func() {
-		deadline := time.Now().Add(time.Second)
-		for server.Clients.Len() > 0 && time.Now().Before(deadline) {
-			time.Sleep(time.Millisecond)
+			return fixture.mqtt
 		}
-
-		_ = server.Close()
-	})
-
-	return server, "tcp://" + listener.Address()
-}
-
-// awaitReady ждёт подтверждения подписки клиента.
-func awaitReady(t *testing.T, client *Client) {
-	t.Helper()
-
-	deadline := time.Now().Add(3 * time.Second)
-	for !client.Ready() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
 	}
+	opts = append(opts, factory)
 
-	if !client.Ready() {
-		t.Fatal("history not ready")
-	}
-}
+	var errNew error
 
-// TestReadRPC проверяет wire-запрос и ответ быстрее завершения публикации.
-func TestReadRPC(t *testing.T) {
-	t.Parallel()
-
-	broker := localBroker(t)
-
-	client, errNew := New(WithBroker(broker))
+	fixture.client, errNew = New(opts...)
 	if errNew != nil {
 		t.Fatal(errNew)
 	}
 
-	t.Cleanup(func() { _ = client.Stop() })
+	fixture.mqtt.EXPECT().Disconnect(uint(0))
+	t.Cleanup(func() { _ = fixture.client.Stop() })
 
-	requests := make(chan request, 2)
-	service := paho.NewClient(paho.NewClientOptions().AddBroker(broker).SetClientID("history-service"))
+	return fixture
+}
 
-	token := service.Connect()
-	if !token.WaitTimeout(time.Second) || token.Error() != nil {
-		t.Fatal("service connect")
+// completedToken создаёт подтверждённую операцию MQTT.
+func completedToken(ctrl *gomock.Controller, err error) *mock.MockToken {
+	token := mock.NewMockToken(ctrl)
+	done := make(chan struct{})
+	close(done)
+	token.EXPECT().Done().Return(done).AnyTimes()
+	token.EXPECT().Error().Return(err).AnyTimes()
+
+	return token
+}
+
+// subscription создаёт подтверждение SUBACK с заданным кодом.
+func (f *historyFixture) subscription(code byte) *mock.MockSubscriptionToken {
+	token := mock.NewMockSubscriptionToken(f.ctrl)
+	done := make(chan struct{})
+	close(done)
+	token.EXPECT().Done().Return(done)
+	token.EXPECT().Error().Return(nil)
+	token.EXPECT().Result().Return(map[string]byte{f.client.topic + "/reply": code})
+
+	return token
+}
+
+// expectSubscribe задаёт операцию подписки и сохраняет обработчик ответа.
+func (f *historyFixture) expectSubscribe(token paho.Token) *gomock.Call {
+	return f.mqtt.EXPECT().Subscribe(f.client.topic+"/reply", byte(1), gomock.Any()).DoAndReturn(func(_ string, _ byte, handler paho.MessageHandler) paho.Token {
+		f.handler = handler
+
+		return token
+	})
+}
+
+// run запускает worker и моделирует подтверждение подключения и подписки.
+func (f *historyFixture) run(t *testing.T) {
+	t.Helper()
+
+	f.mqtt.EXPECT().Connect().Return(completedToken(f.ctrl, nil))
+	f.mqtt.EXPECT().IsConnectionOpen().Return(true).AnyTimes()
+	f.expectSubscribe(f.subscription(1))
+
+	errRun := f.client.Run(context.Background())
+	if errRun != nil {
+		t.Fatal(errRun)
 	}
 
-	t.Cleanup(func() { service.Disconnect(0) })
+	f.config.OnConnect(f.mqtt)
 
-	subscription := service.Subscribe("/rpc/v1/db_logger/history/get_values/+", 1, func(_ paho.Client, message paho.Message) {
-		if message.Retained() {
-			t.Error("retained request")
+	if !f.client.Ready() {
+		t.Fatal("history not ready after SUBACK")
+	}
+}
+
+// publish ожидает единственный JSON-запрос и передаёт его тесту.
+func (f *historyFixture) publish(t *testing.T, token paho.Token) <-chan request {
+	t.Helper()
+
+	requests := make(chan request, 1)
+
+	f.mqtt.EXPECT().Publish(f.client.topic, byte(1), false, gomock.Any()).DoAndReturn(func(_ string, _ byte, _ bool, payload any) paho.Token {
+		wire, ok := payload.([]byte)
+		if !ok {
+			t.Error("request is not JSON bytes")
+
+			return token
 		}
 
 		var query request
 
-		errJSON := json.Unmarshal(message.Payload(), &query)
+		errJSON := json.Unmarshal(wire, &query)
 		if errJSON != nil {
 			t.Error(errJSON)
-
-			return
 		}
 
 		requests <- query
 
-		reply := `{"id":"` + query.ID + `","result":{"values":[{"c":42,"i":1,"t":1794268801.125,"v":"22.5"}],"has_more":false}}`
-		service.Publish(message.Topic()+"/reply", 1, false, reply)
+		return token
 	})
-	if !subscription.WaitTimeout(time.Second) || subscription.Error() != nil {
-		t.Fatal("subscribe")
+
+	return requests
+}
+
+// deliver передаёт MQTT-сообщение подписанному обработчику.
+func (f *historyFixture) deliver(payload string, retained bool) {
+	message := mock.NewMockMessage(f.ctrl)
+	message.EXPECT().Retained().Return(retained)
+
+	if !retained {
+		message.EXPECT().Payload().Return([]byte(payload)).AnyTimes()
 	}
 
-	errRun := client.Run(context.Background())
-	if errRun != nil {
-		t.Fatal(errRun)
+	f.handler(f.mqtt, message)
+}
+
+// TestReadRPC проверяет wire-запрос и ответ до PUBACK.
+func TestReadRPC(t *testing.T) {
+	t.Parallel()
+
+	fixture := newHistoryFixture(t)
+	fixture.run(t)
+	puback := mock.NewMockToken(fixture.ctrl)
+	puback.EXPECT().Done().Return(make(chan struct{}))
+	requests := fixture.publish(t, puback)
+	result := make(chan response, 1)
+
+	go func() {
+		points, errRead := fixture.client.Read(context.Background(), historyQuery())
+		result <- response{points: points, err: errRead}
+	}()
+
+	query := <-requests
+	if !validRequest(query) {
+		t.Fatalf("query=%+v", query)
 	}
 
-	awaitReady(t, client)
-
-	points, errRead := client.Read(context.Background(), historyQuery())
-	if errRead != nil {
-		t.Fatal(errRead)
-	}
-
-	if len(points) != 1 || points[0].Value != 22.5 {
-		t.Fatalf("points=%+v", points)
-	}
+	fixture.deliver(`{"id":"`+query.ID+`","result":{"values":[{"c":42,"i":1,"t":1794268801.125,"v":"22.5"}],"has_more":false}}`, false)
 
 	select {
-	case query := <-requests:
-		if !validRequest(query) {
-			t.Fatalf("query=%+v", query)
+	case received := <-result:
+		if received.err != nil || len(received.points) != 1 || received.points[0].Value != 22.5 {
+			t.Fatalf("response=%+v", received)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("missing request")
+		t.Fatal("reply waited for PUBACK")
 	}
 }
 
-// TestLifecycle проверяет недоступность, отмену и завершение клиента.
+// TestLifecycle проверяет недоступность, занятость и отключение клиента.
 func TestLifecycle(t *testing.T) {
 	t.Parallel()
 
-	client, errNew := New(WithBroker(localBroker(t)))
-	if errNew != nil {
-		t.Fatal(errNew)
-	}
+	fixture := newHistoryFixture(t)
 
-	_, errBefore := client.Read(context.Background(), historyQuery())
+	_, errBefore := fixture.client.Read(context.Background(), historyQuery())
 	if !errors.Is(errBefore, ErrUnavailable) {
 		t.Fatal(errBefore)
 	}
 
-	errRun := client.Run(context.Background())
-	if errRun != nil {
-		t.Fatal(errRun)
-	}
-
-	awaitReady(t, client)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
-	defer cancel()
-
+	fixture.run(t)
+	requests := fixture.publish(t, completedToken(fixture.ctrl, nil))
 	result := make(chan error, 1)
 
-	go func() { _, errRead := client.Read(ctx, historyQuery()); result <- errRead }()
+	go func() { _, errRead := fixture.client.Read(context.Background(), historyQuery()); result <- errRead }()
 
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		client.mu.Lock()
-		active := client.pending != nil
-		client.mu.Unlock()
+	<-requests
 
-		if active {
-			break
-		}
-
-		time.Sleep(time.Millisecond)
-	}
-
-	_, errBusy := client.Read(context.Background(), historyQuery())
+	_, errBusy := fixture.client.Read(context.Background(), historyQuery())
 	if !errors.Is(errBusy, ErrBusy) {
 		t.Fatal(errBusy)
 	}
 
-	client.onReconnecting(nil, nil)
+	fixture.config.OnReconnecting(fixture.mqtt, fixture.config)
 
-	if !errors.Is(<-result, ErrUnavailable) {
-		t.Fatal("disconnect did not cancel pending")
+	if !errors.Is(<-result, ErrUnavailable) || fixture.client.Ready() {
+		t.Fatal("disconnect did not cancel pending or reset ready")
 	}
 
-	if client.Ready() {
-		t.Fatal("ready after disconnect")
-	}
-
-	errStop := client.Stop()
+	errStop := fixture.client.Stop()
 	if errStop != nil {
 		t.Fatal(errStop)
 	}
 
-	_, errClosed := client.Read(context.Background(), historyQuery())
+	_, errClosed := fixture.client.Read(context.Background(), historyQuery())
 	if !errors.Is(errClosed, ErrClosed) {
 		t.Fatal(errClosed)
 	}
@@ -225,13 +238,4 @@ func TestLimits(t *testing.T) {
 // validRequest проверяет закреплённые параметры MQTT RPC.
 func validRequest(query request) bool {
 	return query.ID == "1" && query.Params.Version == 1 && query.Params.MaxRecords == 800 && query.Params.Limit == 1001 && query.Params.Timeout <= 8 && query.Params.Timeout >= 1 && query.Params.Milliseconds && query.Params.Timestamp.GT == 1794268800 && query.Params.Timestamp.LT == 1794355200 && len(query.Params.Channels) == 1 && query.Params.Channels[0] == [2]string{"boiler", "temperature"}
-}
-
-// localBroker возвращает адрес изолированного MQTT-брокера.
-func localBroker(t *testing.T) string {
-	t.Helper()
-
-	_, address := localBrokerServer(t)
-
-	return address
 }

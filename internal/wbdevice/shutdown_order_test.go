@@ -2,82 +2,126 @@ package wbdevice
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/Format-C-eft/wb-telegram/internal/wbdevice/mock"
 )
 
-// TestDeviceStaleSetupKeepsShutdownFlag проверяет, что пустой флаг ошибки от устаревшего соединения
-// не перезаписывает "r", выставленный при остановке.
+// TestDeviceStaleSetupKeepsShutdownFlag проверяет отсутствие пустого флага после остановки.
 func TestDeviceStaleSetupKeepsShutdownFlag(t *testing.T) {
 	t.Parallel()
 
-	broker := startBroker(t)
-	dev := startDevice(t, broker, nil)
-	obs := newObserver(t, broker, "/devices/telegram_bot/meta/error")
-	topic := deviceErrorTopic("telegram_bot")
+	dev, client, _, controller := newMockDevice(t)
+	stale := dev.nextGeneration()
 
-	dev.stateMu.Lock()
-	stale := dev.generation
-	dev.stateMu.Unlock()
+	client.EXPECT().IsConnectionOpen().Return(true)
+	publish := expectPublish(client, controller, deviceErrorTopic(dev.id), ErrorFlagRead)
+	client.EXPECT().Disconnect(uint(250)).After(publish)
 
-	// Как в Shutdown: смена поколения и "r" под flagMu.
-	dev.flagMu.Lock()
-	dev.nextGeneration()
-
-	errPublish := dev.publish(topic, ErrorFlagRead)
-
-	dev.flagMu.Unlock()
-
-	if errPublish != nil {
-		t.Fatalf("publish r: %v", errPublish)
+	if errShutdown := dev.Shutdown(context.Background()); errShutdown != nil {
+		t.Fatal(errShutdown)
 	}
 
-	waitFor(t, "device error r", func() bool {
-		value, _ := obs.get(topic)
-
-		return value == ErrorFlagRead
-	})
-
-	errStale := dev.publishHealthy(stale)
-	if errStale != nil {
-		t.Fatalf("publishHealthy(stale): %v", errStale)
+	if errStale := dev.publishHealthy(stale); errStale != nil {
+		t.Fatal(errStale)
 	}
 
-	time.Sleep(300 * time.Millisecond)
+	if dev.Connected() {
+		t.Fatal("device ready after shutdown")
+	}
 
-	if value, _ := obs.get(topic); value != ErrorFlagRead {
-		t.Fatalf("meta/error = %q after stale setup, want %q", value, ErrorFlagRead)
+	if errValue := dev.SetValue(t.Context(), "send", "x"); !errors.Is(errValue, ErrNotConnected) {
+		t.Fatalf("SetValue after shutdown = %v", errValue)
 	}
 }
 
-// TestDeviceRunHonorsContext проверяет, что отмена контекста прерывает ожидание готовности в Run.
-func TestDeviceRunHonorsContext(t *testing.T) {
+// TestDeviceShutdownExpiredContext проверяет минимальное ожидание PUBACK флага r.
+func TestDeviceShutdownExpiredContext(t *testing.T) {
 	t.Parallel()
 
-	broker := startBroker(t)
+	dev, client, _, controller := newMockDevice(t, WithTimeout(2*time.Second))
+	client.EXPECT().IsConnectionOpen().Return(true)
 
-	dev, errNew := New("telegram_bot",
-		WithBroker(broker),
-		WithClientID("dev-"+t.Name()),
-		WithStaleWindow(5*time.Second),
-	)
-	if errNew != nil {
-		t.Fatalf("New: %v", errNew)
-	}
+	token := mock.NewMockToken(controller)
+	publish := client.EXPECT().Publish(deviceErrorTopic(dev.id), byte(1), true, ErrorFlagRead).Return(token)
+	token.EXPECT().WaitTimeout(shutdownPublishFloor).Return(true)
+	token.EXPECT().Error().Return(nil)
+	client.EXPECT().Disconnect(uint(250)).After(publish)
 
-	t.Cleanup(func() { _ = dev.Stop() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 
-	started := time.Now()
+	errShutdown := dev.Shutdown(ctx)
+	if errShutdown != nil {
+		t.Fatal(errShutdown)
+	}
+}
 
-	errRun := dev.Run(ctx)
-	if errRun != nil {
-		t.Fatalf("Run: %v", errRun)
+// TestDeviceShutdownWaitsForHandler проверяет ожидание активного обработчика после отключения.
+func TestDeviceShutdownWaitsForHandler(t *testing.T) {
+	t.Parallel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	dev, client, _, controller := newMockDevice(t, WithWriteHandler(func(string, []byte) { close(entered); <-release }))
+
+	dev.workers.Add(1)
+	go dev.dispatchWrites()
+
+	dev.handleWrite(client, mockMessage(controller, controlOnTopic(dev.id, "send"), []byte("x"), false))
+	<-entered
+	client.EXPECT().IsConnectionOpen().Return(true)
+
+	token := mock.NewMockToken(controller)
+	publish := client.EXPECT().Publish(deviceErrorTopic(dev.id), byte(1), true, ErrorFlagRead).Return(token)
+	ack := token.EXPECT().WaitTimeout(gomock.Any()).Return(true).After(publish)
+	result := token.EXPECT().Error().Return(nil).After(ack)
+	disconnected := make(chan struct{})
+
+	client.EXPECT().Disconnect(uint(250)).Do(func(uint) { close(disconnected) }).After(result)
+
+	done := make(chan error, 1)
+	go func() { done <- dev.Shutdown(context.Background()) }()
+
+	<-disconnected
+
+	select {
+	case errEarly := <-done:
+		close(release)
+		t.Fatalf("Shutdown returned before handler completed: %v", errEarly)
+	default:
 	}
 
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("Run returned after %v, want soon after context cancel", elapsed)
+	close(release)
+
+	select {
+	case errShutdown := <-done:
+		if errShutdown != nil {
+			t.Fatal(errShutdown)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not return after handler completed")
+	}
+}
+
+// TestDeviceShutdownPublishesBeforeDisconnect проверяет отключение после таймаута PUBACK.
+func TestDeviceShutdownPublishesBeforeDisconnect(t *testing.T) {
+	t.Parallel()
+
+	dev, client, _, controller := newMockDevice(t)
+	client.EXPECT().IsConnectionOpen().Return(true)
+
+	token := mock.NewMockToken(controller)
+	publish := client.EXPECT().Publish(deviceErrorTopic(dev.id), byte(1), true, ErrorFlagRead).Return(token)
+	ack := token.EXPECT().WaitTimeout(gomock.Any()).Return(false).After(publish)
+	client.EXPECT().Disconnect(uint(250)).After(ack)
+
+	errShutdown := dev.Shutdown(context.Background())
+	if !errors.Is(errShutdown, ErrTimeout) {
+		t.Fatalf("Shutdown = %v", errShutdown)
 	}
 }
